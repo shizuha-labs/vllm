@@ -414,8 +414,18 @@ class Glm4MoeModelToolParser(ToolParser):
                     # Open quote but no close — more content may arrive
                     parts.append(f'{key_json}: "{escaped}')
                 else:
-                    # Non-string partial: include raw content, no wrapping
-                    parts.append(f"{key_json}: {partial_content}")
+                    # Do NOT emit non-string partial values. The partial path
+                    # emitted raw UNQUOTED content while the complete path emits
+                    # json.dumps(_deserialize(...)), which QUOTES string-like
+                    # values (e.g. "CTX-19" for an anyOf[string,integer] param).
+                    # The two serializations are not prefix-compatible, so the
+                    # suffix-slice diff in _compute_args_diff corrupted the
+                    # stream (dropped opening quote + doubled last char ->
+                    # invalid JSON for downstream clients). Holding the value
+                    # back until </arg_value> arrives keeps args_so_far strictly
+                    # prefix-monotonic and the final JSON identical to the
+                    # non-streaming parser.
+                    pass
 
         if not parts:
             return "{}" if is_complete else ""
