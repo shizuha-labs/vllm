@@ -27,6 +27,15 @@ from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerMetadata,
 )
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
+from vllm.v1.attention.ops.sm121_sparse_indexer import (
+    fp8_mqa_logits_torch as sm121_fp8_mqa_logits_torch,
+)
+from vllm.v1.attention.ops.sm121_sparse_indexer import (
+    fp8_paged_mqa_logits_torch as sm121_fp8_paged_mqa_logits_torch,
+)
+from vllm.v1.attention.ops.sm121_sparse_indexer import (
+    sm121_sparse_indexer_torch_fallback_enabled,
+)
 from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
@@ -229,6 +238,18 @@ def sparse_attn_indexer(
                     chunk.cu_seqlen_ks,
                     chunk.cu_seqlen_ke,
                 )
+            elif (
+                current_platform.is_cuda()
+                and sm121_sparse_indexer_torch_fallback_enabled()
+                and q_scale_slice is None
+            ):
+                logits = sm121_fp8_mqa_logits_torch(
+                    q_slice_cast,
+                    (k_quant_cast, k_scale_cast),
+                    weights[chunk.token_start : chunk.token_end],
+                    chunk.cu_seqlen_ks,
+                    chunk.cu_seqlen_ke,
+                )
             else:
                 logits = fp8_fp4_mqa_logits(
                     (q_slice_cast, q_scale_slice),
@@ -318,6 +339,19 @@ def sparse_attn_indexer(
                 seq_lens_xpu,
                 decode_metadata.block_table,
                 decode_metadata.schedule_metadata,
+                max_model_len,
+            )
+        elif (
+            current_platform.is_cuda()
+            and sm121_sparse_indexer_torch_fallback_enabled()
+            and padded_q_scale is None
+        ):
+            logits = sm121_fp8_paged_mqa_logits_torch(
+                padded_q_quant_cast,
+                kv_cache,
+                weights[:num_padded_tokens],
+                seq_lens,
+                decode_metadata.block_table,
                 max_model_len,
             )
         else:
@@ -440,7 +474,11 @@ class SparseAttnIndexer(CustomOp):
         self.topk_indices_buffer = topk_indices_buffer
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
-        if current_platform.is_cuda() and not has_deep_gemm():
+        if (
+            current_platform.is_cuda()
+            and not has_deep_gemm()
+            and not sm121_sparse_indexer_torch_fallback_enabled()
+        ):
             raise RuntimeError(
                 "Sparse Attention Indexer CUDA op requires DeepGEMM to be installed."
             )
