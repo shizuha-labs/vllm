@@ -25,6 +25,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import (
     get_mla_dims,
 )
+from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.torch_utils import is_quantized_kv_cache
 from vllm.v1.attention.backend import (
@@ -52,6 +53,11 @@ logger = init_logger(__name__)
 FLASHINFER_MLA_SPARSE_WORKSPACE_BUFFER_SIZE = 128 * 1024 * 1024
 
 
+def _is_sm12x_device() -> bool:
+    capability = current_platform.get_device_capability()
+    return capability is not None and capability.major == 12
+
+
 class FlashInferMLASparseBackend(AttentionBackend):
     """FlashInfer MLA backend with sparse attention support.
 
@@ -66,6 +72,7 @@ class FlashInferMLASparseBackend(AttentionBackend):
         "bfloat16",
         "fp8",
         "fp8_e4m3",
+        "fp8_ds_mla",
     ]
 
     @staticmethod
@@ -98,8 +105,9 @@ class FlashInferMLASparseBackend(AttentionBackend):
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
-        # FlashInfer sparse MLA targets Blackwell (SM 10.x)
-        return capability.major == 10
+        # SM100/SM103 use FlashInfer's TRT-LLM sparse MLA path. SM120/SM121
+        # require FlashInfer main's packed sparse backend.
+        return capability.major in [10, 12]
 
     @classmethod
     def supports_combination(
@@ -128,6 +136,13 @@ class FlashInferMLASparseBackend(AttentionBackend):
             # Check for index_topk which indicates sparse model
             if not hasattr(hf_text_config, "index_topk"):
                 return "FlashInfer MLA Sparse requires model with index_topk config"
+        if device_capability.major == 12 and not is_quantized_kv_cache(
+            kv_cache_dtype or "auto"
+        ):
+            return (
+                "FlashInfer MLA Sparse on SM12x requires an fp8 KV cache so vLLM "
+                "can use the packed fp8_ds_mla layout expected by FlashInfer"
+            )
         return None
 
     @staticmethod
@@ -138,6 +153,8 @@ class FlashInferMLASparseBackend(AttentionBackend):
         head_size: int,
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
+        if cache_dtype_str == "fp8_ds_mla":
+            return (num_blocks, block_size, 656)
         return (num_blocks, block_size, head_size)
 
     @classmethod
@@ -307,10 +324,11 @@ class FlashInferMLASparseImpl(SparseMLAAttentionImpl[FlashInferMLASparseMetadata
         self.bmm1_scale: float | None = None
         self.bmm2_scale: float | None = None
 
-        # fp8 query quantization is required when using fp8 kv_cache,
-        # as the TRTLLM-GEN sparse MLA kernel requires matching dtypes
-        # for query and kv_cache (mixed bf16+fp8 is not supported).
-        self.supports_quant_query_input = True
+        # TRT-LLM sparse MLA requires matching FP8 query/KV. FlashInfer's
+        # SM12x packed sparse backend expects BF16 query with uint8 packed KV.
+        self.supports_quant_query_input = not (
+            _is_sm12x_device() and kv_cache_dtype == "fp8_ds_mla"
+        )
 
     def forward_mqa(
         self,
@@ -339,14 +357,31 @@ class FlashInferMLASparseImpl(SparseMLAAttentionImpl[FlashInferMLASparseMetadata
         if self._workspace_buffer is None:
             self._workspace_buffer = _get_workspace_buffer(q.device)
 
+        is_sm12x_packed_sparse = (
+            _is_sm12x_device() and self.kv_cache_dtype == "fp8_ds_mla"
+        )
+
         if self.bmm1_scale is None:
             self.bmm1_scale = self.scale
-            if is_quantized_kv_cache(self.kv_cache_dtype):
+            if (
+                is_quantized_kv_cache(self.kv_cache_dtype)
+                and not is_sm12x_packed_sparse
+            ):
                 self.bmm1_scale *= layer._q_scale_float * layer._k_scale_float
         if self.bmm2_scale is None:
             self.bmm2_scale = 1.0
-            if is_quantized_kv_cache(self.kv_cache_dtype):
+            if (
+                is_quantized_kv_cache(self.kv_cache_dtype)
+                and not is_sm12x_packed_sparse
+            ):
                 self.bmm2_scale *= layer._k_scale_float
+
+        kwargs = {}
+        if is_sm12x_packed_sparse:
+            kwargs = {
+                "backend": "sparse",
+                "kv_scale_format": "arbitrary_fp32",
+            }
 
         o = trtllm_batch_decode_with_kv_cache_mla(
             query=q.unsqueeze(1),
@@ -361,5 +396,6 @@ class FlashInferMLASparseImpl(SparseMLAAttentionImpl[FlashInferMLASparseMetadata
             bmm1_scale=self.bmm1_scale,
             bmm2_scale=self.bmm2_scale,
             sparse_mla_top_k=attn_metadata.topk_tokens,
+            **kwargs,
         )
         return o.view(-1, o.shape[-2], o.shape[-1]), None
