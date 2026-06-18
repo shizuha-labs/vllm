@@ -135,6 +135,34 @@ class Glm4MoeModelToolParser(ToolParser):
         param_types = extract_types_from_schema(param_schema)
         return set(param_types) - {"null"} == {"string"}
 
+    def _is_known_arg(self, tool_name: str, arg_name: str) -> bool:
+        tool_properties = find_tool_properties(self.tools, tool_name)
+        return arg_name in tool_properties
+
+    @staticmethod
+    def _looks_like_json_literal(value: str) -> bool:
+        stripped = value.lstrip()
+        return bool(stripped) and stripped[0] in '"[{0123456789-tfn'
+
+    def _format_complete_arg_value(
+        self, tool_name: str, arg_name: str, value: str
+    ) -> str:
+        if self._is_string_type(tool_name, arg_name):
+            # Don't strip string values — whitespace is significant and must
+            # match the partial-value path for diffing.
+            return json.dumps(value, ensure_ascii=False)
+
+        stripped = value.strip()
+        try:
+            # If the model already emitted valid JSON, preserve it byte-for-byte.
+            # Re-dumping can insert spaces and break streaming prefix diffs.
+            json.loads(stripped)
+            return stripped
+        except json.JSONDecodeError:
+            pass
+
+        return json.dumps(self._deserialize(stripped), ensure_ascii=False)
+
     @staticmethod
     def _tools_enabled(request: ChatCompletionRequest) -> bool:
         """Return whether tool parsing should be applied for this request."""
@@ -342,14 +370,7 @@ class Glm4MoeModelToolParser(ToolParser):
         for key, value in pairs:
             key = key.strip()
             key_json = json.dumps(key, ensure_ascii=False)
-            if self._is_string_type(tool_name, key):
-                # Don't strip string values — whitespace is significant
-                # and must match the partial-value path for diffing.
-                val_json = json.dumps(value, ensure_ascii=False)
-            else:
-                val_json = json.dumps(
-                    self._deserialize(value.strip()), ensure_ascii=False
-                )
+            val_json = self._format_complete_arg_value(tool_name, key, value)
             parts.append(f"{key_json}: {val_json}")
 
         # Check for a partial (incomplete) arg value
@@ -382,15 +403,17 @@ class Glm4MoeModelToolParser(ToolParser):
                     # Tool call finished but </arg_value> is missing
                     # (malformed output). Treat partial as complete value
                     # so the diff naturally closes any open quotes.
-                    if self._is_string_type(tool_name, partial_key):
-                        val_json = json.dumps(partial_content, ensure_ascii=False)
-                    else:
-                        val_json = json.dumps(
-                            self._deserialize(partial_content.strip()),
-                            ensure_ascii=False,
-                        )
+                    val_json = self._format_complete_arg_value(
+                        tool_name, partial_key, partial_content
+                    )
                     parts.append(f"{key_json}: {val_json}")
-                elif self._is_string_type(tool_name, partial_key):
+                elif (
+                    self._is_string_type(tool_name, partial_key)
+                    or (
+                        not self._is_known_arg(tool_name, partial_key)
+                        and not self._looks_like_json_literal(partial_content)
+                    )
+                ):
                     escaped = self._json_escape_string_content(partial_content)
                     # Open quote but no close — more content may arrive
                     parts.append(f'{key_json}: "{escaped}')

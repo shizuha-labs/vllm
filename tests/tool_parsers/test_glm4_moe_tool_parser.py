@@ -1483,3 +1483,101 @@ def test_streaming_with_function_tool(
     assert len(glm4_moe_parser_function_tools.prev_tool_call_arr) == 1
     args = json.loads(glm4_moe_parser_function_tools.prev_tool_call_arr[0]["arguments"])
     assert args["city"] == "Beijing"
+
+
+def test_streaming_unknown_string_arg_remains_valid_json(glm4_moe_tokenizer):
+    """Unknown string-like extra args must not be streamed raw then re-quoted."""
+    tools = [
+        ChatCompletionToolsParam(
+            function=FunctionDefinition(
+                name="bash",
+                parameters={
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                },
+            ),
+        ),
+    ]
+    parser = Glm4MoeModelToolParser(glm4_moe_tokenizer, tools=tools)
+    request = ChatCompletionRequest(model=MODEL, messages=[], tools=tools)
+    chunks = [
+        "<tool_call>bash\n",
+        "<arg_key>command</arg_key>",
+        "<arg_value>ls -la</arg_value>",
+        "<arg_key>description</arg_key>",
+        "<arg_value>C",
+        "heck workspace",
+        "</arg_value>",
+        "</tool_call>",
+    ]
+
+    current_text = ""
+    deltas = []
+    for chunk in chunks:
+        previous_text = current_text
+        current_text += chunk
+        delta = parser.extract_tool_calls_streaming(
+            previous_text=previous_text,
+            current_text=current_text,
+            delta_text=chunk,
+            previous_token_ids=[],
+            current_token_ids=[],
+            delta_token_ids=[],
+            request=request,
+        )
+        if delta is not None:
+            deltas.append(delta)
+
+    _, tools_found = _collect_from_deltas(deltas)
+    args = json.loads("".join(tools_found[0]["args_fragments"]))
+    assert args == {"command": "ls -la", "description": "Check workspace"}
+
+
+def test_streaming_json_array_arg_preserves_raw_prefix(glm4_moe_tokenizer):
+    """Valid JSON args must keep their raw spacing so streamed diffs stay valid."""
+    tools = [
+        ChatCompletionToolsParam(
+            function=FunctionDefinition(
+                name="collect",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "items": {"type": "array", "items": {"type": "string"}}
+                    },
+                },
+            ),
+        ),
+    ]
+    parser = Glm4MoeModelToolParser(glm4_moe_tokenizer, tools=tools)
+    request = ChatCompletionRequest(model=MODEL, messages=[], tools=tools)
+    chunks = [
+        "<tool_call>collect\n",
+        "<arg_key>items</arg_key>",
+        "<arg_value>[",
+        '"a"',
+        ",",
+        '"b"',
+        "]</arg_value>",
+        "</tool_call>",
+    ]
+
+    current_text = ""
+    deltas = []
+    for chunk in chunks:
+        previous_text = current_text
+        current_text += chunk
+        delta = parser.extract_tool_calls_streaming(
+            previous_text=previous_text,
+            current_text=current_text,
+            delta_text=chunk,
+            previous_token_ids=[],
+            current_token_ids=[],
+            delta_token_ids=[],
+            request=request,
+        )
+        if delta is not None:
+            deltas.append(delta)
+
+    _, tools_found = _collect_from_deltas(deltas)
+    args = json.loads("".join(tools_found[0]["args_fragments"]))
+    assert args == {"items": ["a", "b"]}
