@@ -39,7 +39,10 @@ def cutlass_group_gemm_supported() -> bool:
 
 
 CUTLASS_FP8_SUPPORTED = cutlass_fp8_supported()
-CUTLASS_BLOCK_FP8_SUPPORTED = cutlass_block_fp8_supported()
+# SM121: ops.cutlass_scaled_mm_supports_block_fp8 wrongly accepts 12.1 but the
+# c3x kernels fail at runtime ('Invalid status'). Env-gate forces the Triton
+# block-FP8 fallback (proven on GB10). No-op unless SM121_NO_CUTLASS_BLOCKFP8=1.
+CUTLASS_BLOCK_FP8_SUPPORTED = cutlass_block_fp8_supported() and __import__("os").environ.get("SM121_NO_CUTLASS_BLOCKFP8") != "1"
 
 
 def per_tensor_dequantize(

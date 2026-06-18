@@ -983,7 +983,7 @@ class DeepseekV2MLAAttention(nn.Module):
             mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
             self.scaling = self.scaling * mscale * mscale
 
-        self.is_v32 = hasattr(config, "index_topk")
+        self.is_v32 = hasattr(config, "index_topk") and __import__("os").environ.get("GLM5_FORCE_DENSE") != "1"
 
         _skip_topk = False
         if self.is_v32:
@@ -1214,7 +1214,7 @@ class DeepseekV2Model(nn.Module):
         self.device = current_platform.device_type
 
         self.vocab_size = config.vocab_size
-        self.is_v32 = hasattr(config, "index_topk")
+        self.is_v32 = hasattr(config, "index_topk") and __import__("os").environ.get("GLM5_FORCE_DENSE") != "1"
         if self.is_v32:
             topk_tokens = config.index_topk
             topk_indices_buffer = torch.empty(
@@ -1377,6 +1377,12 @@ class DeepseekV2Model(nn.Module):
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
+                continue
+
+            # GLM5_FORCE_DENSE: when running a DSA model (glm_moe_dsa / DeepSeek-V3.2)
+            # as dense MLA on sm_121 (no sparse-attn backend exists), the indexer is
+            # not built — skip its weights to avoid a KeyError in params_dict.
+            if __import__("os").environ.get("GLM5_FORCE_DENSE") == "1" and ".indexer" in name:
                 continue
 
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
