@@ -16,7 +16,8 @@ def test_sm12x_flashinfer_sparse_requires_quantized_kv_cache(monkeypatch):
 
     fake_config = SimpleNamespace(
         model_config=SimpleNamespace(
-            hf_text_config=SimpleNamespace(qk_nope_head_dim=128, index_topk=2048)
+            # GLM-5.2-FP8 actual DSA shape.
+            hf_text_config=SimpleNamespace(qk_nope_head_dim=192, index_topk=2048)
         )
     )
     monkeypatch.setattr(config_module, "get_current_vllm_config", lambda: fake_config)
@@ -38,6 +39,18 @@ def test_sm12x_flashinfer_sparse_requires_quantized_kv_cache(monkeypatch):
         head_size=576,
         dtype=torch.bfloat16,
         kv_cache_dtype="fp8",
+        block_size=64,
+        use_mla=True,
+        has_sink=False,
+        use_sparse=True,
+        device_capability=DeviceCapability(12, 1),
+    )
+    assert reason is None
+
+    reason = FlashInferMLASparseBackend.supports_combination(
+        head_size=576,
+        dtype=torch.bfloat16,
+        kv_cache_dtype="fp8_e4m3",
         block_size=64,
         use_mla=True,
         has_sink=False,
