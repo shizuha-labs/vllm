@@ -851,6 +851,24 @@ RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist
         --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
     fi
 
+# PLAT-4203: vendor DeepGEMM 2.5.0 into the installed vllm package.
+# The 0.23 fork's CMake DeepGEMM build (cmake/external_projects/deepgemm.cmake)
+# only targets 9.0a/10.0a/10.0f, so it no-ops for our 12.1a-only sm121 build
+# and leaves vllm/third_party/deep_gemm/ absent. Copy in the known-good
+# artifact (extracted from the sparkrun 0.21.1 prod pod, same torch==2.11.0
+# pin as this fork) directly into the installed site-packages tree so
+# support_deep_gemm()'s sm120-family clause has a working backend.
+COPY build-assets/deep_gemm-2.5.0-vendored.tar /tmp/deep_gemm.tar
+RUN VLLM_PKG_DIR=$(python3 -c "import vllm, os; print(os.path.dirname(vllm.__file__))") \
+    && echo "vllm package dir: ${VLLM_PKG_DIR}" \
+    && mkdir -p "${VLLM_PKG_DIR}/third_party" \
+    && rm -rf "${VLLM_PKG_DIR}/third_party/deep_gemm" \
+    && mkdir -p "${VLLM_PKG_DIR}/third_party/deep_gemm" \
+    && tar xf /tmp/deep_gemm.tar -C "${VLLM_PKG_DIR}/third_party/deep_gemm" \
+    && find "${VLLM_PKG_DIR}/third_party/deep_gemm" -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true \
+    && rm -f /tmp/deep_gemm.tar \
+    && ls -la "${VLLM_PKG_DIR}/third_party/deep_gemm"
+
 RUN --mount=type=cache,target=/opt/uv/cache \
 . /etc/environment && \
 uv pip list
