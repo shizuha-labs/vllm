@@ -12,6 +12,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
+    SupportsHMA,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.p2p.p2p_nccl_engine import (
     P2pNcclEngine,
@@ -34,19 +35,23 @@ logger = init_logger(__name__)
 class ReqMeta:
     # Request Id
     request_id: str
-    # Request block ids
-    block_ids: torch.Tensor
+    # Request block ids, one tensor per kv-cache group (HMA-aware). In
+    # single-group (non-hybrid) mode this is a 1-tuple.
+    block_ids: tuple[torch.Tensor, ...]
     # Request num tokens
     num_tokens: int
 
     @staticmethod
     def make_meta(
-        request_id: str, token_ids: list[int], block_ids: list[int], block_size: int
+        request_id: str,
+        token_ids: list[int],
+        block_ids: tuple[list[int], ...],
+        block_size: int,
     ) -> "ReqMeta":
-        block_ids_tensor = torch.tensor(block_ids)
+        block_ids_tensors = tuple(torch.tensor(ids) for ids in block_ids)
         return ReqMeta(
             request_id=request_id,
-            block_ids=block_ids_tensor,
+            block_ids=block_ids_tensors,
             num_tokens=len(token_ids),
         )
 
@@ -62,7 +67,7 @@ class P2pNcclConnectorMetadata(KVConnectorMetadata):
         self,
         request_id: str,
         token_ids: list[int],
-        block_ids: list[int],
+        block_ids: tuple[list[int], ...],
         block_size: int,
     ) -> None:
         self.requests.append(
@@ -70,7 +75,7 @@ class P2pNcclConnectorMetadata(KVConnectorMetadata):
         )
 
 
-class P2pNcclConnector(KVConnectorBase_V1):
+class P2pNcclConnector(KVConnectorBase_V1, SupportsHMA):
     def __init__(
         self,
         vllm_config: "VllmConfig",
@@ -83,9 +88,10 @@ class P2pNcclConnector(KVConnectorBase_V1):
             kv_cache_config=kv_cache_config,
         )
         self._block_size = vllm_config.cache_config.block_size
+        self._layer_to_group: dict[str, int] | None = None
         self._requests_need_load: dict[str, Any] = {}
         self.is_producer = self._kv_transfer_config.is_kv_producer
-        self.chunked_prefill: dict[str, tuple[list[int], list[int] | None]] = {}
+        self.chunked_prefill: dict[str, tuple[tuple[list[int], ...], list[int] | None]] = {}
 
         self._rank = get_world_group().rank if role == KVConnectorRole.WORKER else 0
         self._local_rank = (
@@ -106,6 +112,23 @@ class P2pNcclConnector(KVConnectorBase_V1):
     # ==============================
     # Worker-side methods
     # ==============================
+
+    def _group_index_for_layer(self, layer_name: str) -> int:
+        """Map an attention layer to its kv-cache group index (HMA)."""
+        if self._layer_to_group is None:
+            mapping: dict[str, int] = {}
+            if self._kv_cache_config is not None:
+                for gi, group in enumerate(self._kv_cache_config.kv_cache_groups):
+                    for ln in group.layer_names:
+                        mapping[ln] = gi
+            self._layer_to_group = mapping
+        return self._layer_to_group.get(layer_name, 0)
+
+    def _blocks_for_layer(self, request: ReqMeta, layer_name: str) -> torch.Tensor:
+        gi = self._group_index_for_layer(layer_name)
+        if gi >= len(request.block_ids):
+            gi = 0
+        return request.block_ids[gi]
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
         """Start loading the KV cache from the connector buffer to vLLM's
@@ -202,8 +225,16 @@ class P2pNcclConnector(KVConnectorBase_V1):
                     logger.warning("🚧kv_cache is None, %s", request.request_id)
                     continue
 
+                block_ids = self._blocks_for_layer(request, layer_name)
+                if block_ids.numel() == 0:
+                    logger.warning(
+                        "🚧no blocks for layer %s, request %s",
+                        layer_name,
+                        request.request_id,
+                    )
+                    continue
                 inject_kv_into_layer(
-                    layer, kv_cache, request.block_ids, request.request_id
+                    layer, kv_cache, block_ids, request.request_id
                 )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
@@ -248,7 +279,10 @@ class P2pNcclConnector(KVConnectorBase_V1):
             ip, port = self.parse_request_id(request_id, True)
             remote_address = ip + ":" + str(port + self._rank)
 
-            kv_cache = kv_layer[request.block_ids, ...]
+            block_ids = self._blocks_for_layer(request, layer_name)
+            if block_ids.numel() == 0:
+                continue
+            kv_cache = kv_layer[block_ids, ...]
             self.p2p_nccl_engine.send_tensor(
                 request_id + "#" + layer_name, kv_cache, remote_address
             )
@@ -319,7 +353,7 @@ class P2pNcclConnector(KVConnectorBase_V1):
         if not self.is_producer and num_external_tokens > 0:
             self._requests_need_load[request.request_id] = (
                 request,
-                blocks.get_block_ids()[0],
+                blocks.get_block_ids(),
             )
 
     def build_connector_meta(
@@ -347,7 +381,7 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 if num_tokens < len(new_req.prompt_token_ids or []):
                     # 'CachedRequestData' has no attribute 'prompt_token_ids'
                     self.chunked_prefill[new_req.req_id] = (
-                        new_req.block_ids[0],
+                        tuple(list(ids) for ids in new_req.block_ids),
                         new_req.prompt_token_ids,
                     )
                     continue
@@ -355,7 +389,7 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 meta.add_request(
                     request_id=new_req.req_id,
                     token_ids=new_req.prompt_token_ids or [],
-                    block_ids=new_req.block_ids[0],
+                    block_ids=tuple(new_req.block_ids),
                     block_size=self._block_size,
                 )
                 continue
@@ -363,7 +397,7 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 meta.add_request(
                     request_id=new_req.req_id,
                     token_ids=new_req.prompt_token_ids or [],
-                    block_ids=new_req.block_ids[0],
+                    block_ids=tuple(new_req.block_ids),
                     block_size=self._block_size,
                 )
                 self._requests_need_load.pop(new_req.req_id)
@@ -379,9 +413,12 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 num_tokens = num_scheduled_tokens + num_computed_tokens
                 assert req_id in self.chunked_prefill
                 assert new_block_ids is not None
-                block_ids = new_block_ids[0]
+                block_ids = tuple(list(ids) for ids in new_block_ids)
                 if not resumed_from_preemption:
-                    block_ids = self.chunked_prefill[req_id][0] + block_ids
+                    prev = self.chunked_prefill[req_id][0]
+                    block_ids = tuple(
+                        list(a) + list(b) for a, b in zip(prev, block_ids)
+                    )
                 prompt_token_ids = self.chunked_prefill[req_id][1]
                 assert prompt_token_ids is not None
                 # the request's prompt is chunked prefill again
@@ -410,7 +447,7 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 # NOTE(rob): For resumed req, new_block_ids is all
                 # of the block_ids for the request.
                 assert new_block_ids is not None
-                block_ids = new_block_ids[0]
+                block_ids = tuple(new_block_ids)
 
                 meta.add_request(
                     request_id=req_id,
@@ -441,6 +478,17 @@ class P2pNcclConnector(KVConnectorBase_V1):
         self.chunked_prefill.pop(request.request_id, None)
 
         return False, None
+
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        """HMA variant of request_finished: called once per request with
+        per-group block ids, before blocks are freed for each group. The P2P
+        connector sends KV synchronously per layer during save, so no async
+        block retention is needed for any group."""
+        return self.request_finished(request, block_ids[0] if block_ids else [])
 
     # ==============================
     # Static methods
