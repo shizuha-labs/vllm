@@ -1,0 +1,24 @@
+--- orig/core/block_pool.py
++++ tree/core/block_pool.py
+@@ -419 +419,3 @@
+-    def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
++    def free_blocks(
++        self, ordered_blocks: Iterable[KVCacheBlock], prepend: bool = False
++    ) -> None:
+@@ -425,0 +428,5 @@
++            prepend: Whether to put newly-free blocks at the front of the free
++                queue to be prioritized for reuse. Backport of upstream vLLM
++                #43447 (PLAT-4203): uncached scratch blocks are prepended
++                (recycled first) so cached prefix blocks appended at the back
++                survive longer for a future prefix-cache hit.
+@@ -431,3 +438,7 @@
+-        self.free_block_queue.append_n(
+-            [block for block in blocks_list if block.ref_cnt == 0 and not block.is_null]
+-        )
++        freed_blocks = [
++            block for block in blocks_list if block.ref_cnt == 0 and not block.is_null
++        ]
++        if prepend:
++            self.free_block_queue.prepend_n(freed_blocks)
++        else:
++            self.free_block_queue.append_n(freed_blocks)

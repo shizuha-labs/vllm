@@ -1,0 +1,52 @@
+--- orig/core/single_type_kv_cache_manager.py
++++ tree/core/single_type_kv_cache_manager.py
+@@ -528 +528,6 @@
+-        removed_blocks: list[KVCacheBlock] = []
++        # Backport of upstream vLLM #43447 (PLAT-4203): reuse skipped local
++        # blocks in order — uncached scratch blocks (no prefix-cache value) are
++        # recycled first, cached blocks (reusable prefix-cache value) last, so a
++        # future prefix-cache hit can still find the cached sliding-window tail.
++        removed_cached_blocks: list[KVCacheBlock] = []
++        removed_uncached_blocks: list[KVCacheBlock] = []
+@@ -537 +542,4 @@
+-            removed_blocks.append(blocks[i])
++            if blocks[i].block_hash is None:
++                removed_uncached_blocks.append(blocks[i])
++            else:
++                removed_cached_blocks.append(blocks[i])
+@@ -539 +547,5 @@
+-        self.block_pool.free_blocks(removed_blocks)
++        # `prepend=True` makes uncached scratch blocks the next allocation
++        # candidates, while cached blocks stay behind them as best-effort
++        # prefix-cache entries.
++        self.block_pool.free_blocks(removed_cached_blocks)
++        self.block_pool.free_blocks(removed_uncached_blocks, prepend=True)
+@@ -836,0 +849,28 @@
++
++    def free(self, request_id: str) -> None:
++        # Backport of upstream vLLM #43447 (PLAT-4203): like
++        # remove_skipped_blocks, prepend uncached (scratch) blocks and append
++        # cached (prefix) blocks to the free queue so cached sliding-window
++        # prefix blocks survive across request boundaries and can serve a
++        # partial prefix-cache hit on the next turn instead of forcing a full
++        # re-prefill of the whole session.
++        #
++        # NOTE: blocks still carrying an extra "protected prompt block"
++        # reference (SlidingWindowMLAManager._protect_prompt_blocks, which
++        # touch()es boundary blocks) keep ref_cnt > 0 after this single
++        # decrement and are therefore NOT enqueued here — free_blocks only
++        # queues blocks whose ref_cnt reaches 0. This override only reorders
++        # eviction priority and never frees a still-referenced block, so it
++        # composes with the existing protected-prompt-block machinery.
++        req_blocks = self.req_to_blocks.pop(request_id, [])
++        if req_blocks:
++            cached_blocks: list[KVCacheBlock] = []
++            uncached_blocks: list[KVCacheBlock] = []
++            for block in reversed(req_blocks):
++                if block.block_hash is None:
++                    uncached_blocks.append(block)
++                else:
++                    cached_blocks.append(block)
++            self.block_pool.free_blocks(cached_blocks)
++            self.block_pool.free_blocks(uncached_blocks, prepend=True)
++        self.num_cached_block.pop(request_id, None)

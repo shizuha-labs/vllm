@@ -1,0 +1,14 @@
+--- orig/envs.py
++++ tree/envs.py
+@@ -282,0 +283 @@
++    VLLM_DSV4_SINGLE_EAGLE_DROP: bool = False
+@@ -1029,0 +1031,9 @@
++    ),
++    # PLAT-4203 hitfix (default OFF). When set, the HybridKVCacheCoordinator
++    # finds the longest COMMON prefix hit with no per-group EAGLE drop and then
++    # applies a SINGLE lcm-aligned EAGLE drop after convergence (#40624 Option
++    # A). Fixes the DSV4 multi-group append-under-MTP 0-hit spiral (#42948).
++    # Correctness-safe: it can only shorten the hit, never overclaim.
++    "VLLM_DSV4_SINGLE_EAGLE_DROP": lambda: (
++        os.environ.get("VLLM_DSV4_SINGLE_EAGLE_DROP", "0").strip().lower()
++        in ("1", "true")
