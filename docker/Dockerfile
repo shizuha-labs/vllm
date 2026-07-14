@@ -343,6 +343,18 @@ COPY build_rust.sh build_rust.sh
 # (rustc spawns enough concurrent processes to hit RLIMIT_NOFILE otherwise).
 ENV CARGO_BUILD_JOBS=4
 
+# Harden cargo against transient crates.io network flakes. Two 0.25.1 builds
+# failed on static.crates.io HTTP timeouts ("failed to transfer more than 10
+# bytes in 30s" pulling tiktoken-rs / windows-sys) because there is no
+# in-cluster crates.io pull-through mirror yet. Until one exists, lean on more
+# retries, a generous per-request timeout, HTTP/1.1 (disable HTTP/2
+# multiplexing, which stalls behind flaky proxies), and the git CLI for any
+# git-sourced deps. Mirrors the UV_HTTP_RETRIES=10 hardening on the Python side.
+ENV CARGO_NET_RETRY=10 \
+    CARGO_HTTP_TIMEOUT=120 \
+    CARGO_HTTP_MULTIPLEXING=false \
+    CARGO_NET_GIT_FETCH_WITH_CLI=true
+
 # BuildKit can run this stage in parallel with csrc-build. Keep Rust on a
 # separate local sccache daemon while sharing the same remote cache backend.
 ENV SCCACHE_SERVER_PORT=4227
