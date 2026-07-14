@@ -478,6 +478,12 @@ RUN --mount=type=cache,target=/root/.cache/ccache \
 FROM base AS extensions-build
 ARG CUDA_VERSION
 
+# Bound DeepEP/torch cpp_extension build parallelism (torch BuildExtension reads
+# MAX_JOBS; defaults to nproc). Shares the `max_jobs` build-arg with csrc-build so
+# a single --build-arg caps peak build memory in constrained CI namespaces.
+ARG max_jobs=2
+ENV MAX_JOBS=${max_jobs}
+
 # This timeout (in seconds) is necessary when installing some dependencies via uv since it's likely to time out
 ENV UV_HTTP_TIMEOUT=500
 ENV UV_INDEX_STRATEGY="unsafe-best-match"
