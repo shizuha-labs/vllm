@@ -99,6 +99,11 @@ ARG INSTALL_KV_CONNECTORS=false
 # prepare basic build environment
 FROM ${BUILD_BASE_IMAGE} AS base
 
+# Harden transient package-index flakes (e.g. download.pytorch.org 503s under
+# unsafe-best-match): uv's default retry count is 3; raise it so brief upstream
+# blips don't fail a multi-hour build. Inherited by rust/csrc/extensions/build.
+ENV UV_HTTP_RETRIES=10
+
 ARG TARGETPLATFORM
 ARG CUDA_VERSION
 ARG PYTHON_VERSION
@@ -658,6 +663,10 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 #################### vLLM installation IMAGE ####################
 # image with vLLM installed
 FROM ${FINAL_BASE_IMAGE} AS vllm-base
+
+# Harden transient package-index flakes (see base stage). Inherited by
+# vllm-openai-base / vllm-openai.
+ENV UV_HTTP_RETRIES=10
 
 ARG CUDA_VERSION
 ARG PYTHON_VERSION
