@@ -1032,6 +1032,12 @@ ENV UV_HTTP_TIMEOUT=500
 # Do not add +PTX here; see the main TORCH_CUDA_ARCH_LIST comment above.
 ARG torch_cuda_arch_list='7.5 8.0 8.6 8.9 9.0 10.0 11.0 12.0'
 ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
+# GB10 (sm_121) native runtime JIT: FlashInfer reads FLASHINFER_CUDA_ARCH_LIST
+# for its at-runtime kernel compilation. It is not a Dockerfile ARG upstream,
+# so bake it here to target the family-specific SM12x arch natively (avoids the
+# default 12.0+PTX fallback that produces non-native sm_12x cubins).
+ARG flashinfer_cuda_arch_list='12.1a'
+ENV FLASHINFER_CUDA_ARCH_LIST=${flashinfer_cuda_arch_list}
 RUN --mount=type=cache,target=/opt/uv/cache \
     --mount=type=bind,source=requirements/kv_connectors.txt,target=/tmp/kv_connectors.txt,ro \
     CUDA_MAJOR="${CUDA_VERSION%%.*}"; \
