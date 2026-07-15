@@ -839,11 +839,18 @@ RUN --mount=type=cache,target=/opt/uv/cache \
     fi && \
     rm /tmp/requirements-cuda.txt /tmp/common.txt
 
-# Install FlashInfer JIT cache (requires CUDA-version-specific index URL)
+# Install FlashInfer cubin + JIT cache (both from the flashinfer.ai index).
 # https://docs.flashinfer.ai/installation.html
 # From versions.json: .flashinfer.version
-ARG FLASHINFER_VERSION=0.6.13
+# NOTE(shizuha): must match requirements/cuda.txt flashinfer-python. flashinfer
+# enforces flashinfer-cubin == flashinfer-python exactly and flashinfer-jit-cache
+# version-prefix match at import (flashinfer/jit/env.py). flashinfer-cubin 0.6.14 is
+# NOT on PyPI, so it is installed here with its own --index-url (root of the
+# flashinfer.ai simple index; cubin wheels are arch/cuda-agnostic py3-none-any).
+ARG FLASHINFER_VERSION=0.6.14
 RUN --mount=type=cache,target=/opt/uv/cache \
+    uv pip install --system --no-deps flashinfer-cubin==${FLASHINFER_VERSION} \
+        --index-url https://flashinfer.ai/whl/ && \
     uv pip install --system flashinfer-jit-cache==${FLASHINFER_VERSION} \
         --index-url https://flashinfer.ai/whl/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')
 
