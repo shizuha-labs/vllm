@@ -16,7 +16,9 @@ permissions:
 
 jobs:
   pre-run-check:
-    if: github.event_name == 'pull_request'
+    # GitHub's cross-repository search API is unavailable on Forgejo. Origin
+    # relies on its native PR review gate, so skip only this GitHub-specific gate.
+    if: github.event_name == 'pull_request' && github.server_url == 'https://github.com'
     runs-on: ubuntu-latest
     steps:
     - name: Check PR label and author merge count
