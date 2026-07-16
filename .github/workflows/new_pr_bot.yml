@@ -9,6 +9,9 @@ permissions:
 
 jobs:
   update-description:
+    # This bot calls GitHub-only APIs via actions/github-script. Origin is the
+    # canonical CI host, so skip it there instead of failing every opened PR.
+    if: ${{ github.server_url == 'https://github.com' }}
     runs-on: ubuntu-latest
     steps:
       - name: Update PR description
@@ -52,6 +55,7 @@ jobs:
             }
 
   reminder-comment:
+    if: ${{ github.server_url == 'https://github.com' }}
     runs-on: ubuntu-latest
     steps:
       - name: Post welcome comment for first-time contributors
