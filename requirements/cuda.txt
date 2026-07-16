@@ -10,9 +10,16 @@ torchaudio==2.11.0
 torchvision==0.26.0 # Required for phi3v processor. See https://github.com/pytorch/vision?tab=readme-ov-file#installation for corresponding version
 torchcodec >= 0.14
 PyNvVideoCodec==2.0.4
-# FlashInfer should be updated together with the Dockerfile
-flashinfer-python==0.6.13
-flashinfer-cubin==0.6.13
+# FlashInfer should be updated together with the Dockerfile.
+# NOTE(shizuha): vLLM v0.25.1's deepseek_v4 flashinfer_sparse.py calls
+# trtllm_batch_decode_sparse_mla_dsv4(swa_topk_lens=..., extra_sparse_indices=...,
+# extra_sparse_topk_lens=...), which only exist in flashinfer >= 0.6.14. The stock
+# v0.25.1 pin of 0.6.13 is a stale-pin bug that crashes DSV4 engine init on GB10.
+# flashinfer-cubin 0.6.14 is published ONLY on the flashinfer.ai index (not PyPI),
+# so cubin is installed in docker/Dockerfile next to flashinfer-jit-cache, both
+# pinned to ARG FLASHINFER_VERSION (flashinfer enforces cubin==python exactly and
+# jit-cache version-prefix match at import time).
+flashinfer-python==0.6.14
 apache-tvm-ffi==0.1.9
 tilelang==0.1.9
 nvidia-cudnn-frontend>=1.19.1

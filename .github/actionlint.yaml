@@ -3,5 +3,7 @@
 self-hosted-runner:
   labels:
     - vllm-runners
+    - amd64
+    - s1-amd64
     # Not yet in actionlint's known-label set.
     - macos-26
