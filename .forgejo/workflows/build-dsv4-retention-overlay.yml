@@ -64,7 +64,7 @@ jobs:
 
       - name: Install pinned kubectl and cluster access
         env:
-          PACKAGE_TOKEN: ${{ secrets.ORIGIN_PACKAGE_TOKEN }}
+          PACKAGE_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           KUBECTL_ARCH=$(uname -m)
