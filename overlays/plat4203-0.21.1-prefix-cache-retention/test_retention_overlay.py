@@ -202,6 +202,14 @@ def test_block_pool_wires_all_retention_lifecycle_paths():
     assert "+ self.priority_eviction_queue.num_blocks" in source
 
 
+def test_scheduler_wires_bounded_prefix_replay():
+    source = (HERE / "vllm/v1/core/sched/scheduler_retention.py").read_text()
+    assert "VLLM_PREFIX_CACHE_MIN_RECOMPUTE_TOKENS" in source
+    assert "request.num_tokens - min_recompute_tokens" in source
+    assert "manager.coordinator.find_longest_cache_hit(" in source
+    assert "manager.get_computed_blocks = get_computed_blocks" in source
+
+
 def test_protocol_fields_validation_and_sampling_round_trip(tmp_path):
     try:
         import vllm._C  # noqa: F401

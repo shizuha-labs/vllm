@@ -13,6 +13,14 @@ session re-prefills the entire prompt). Two independent halves:
 Latest image: `gx10-1:30500/vllm-ds4-sm121:0.21.1-retention-hitfix-<sha>`
 (retention-only image: `...:0.21.1-retention-<sha>`).
 
+## Bounded APC replay for SM121 continuation latency
+
+`VLLM_PREFIX_CACHE_MIN_RECOMPUTE_TOKENS` is default-off. On the DeepSeek V4
+SM121 fleet it is set to `2048`, bounding prefix-cache reuse so a long cached
+continuation recomputes a real token tail instead of entering the pathological
+small-suffix sparse-MLA path. This changes only how much valid KV is reused; it
+never pads, removes, or changes input tokens.
+
 ## The MTP hitfix (half 2) — why the append returned 0 hits
 
 DeepSeek-V4-Flash builds **4 attention groups** (1 MLA-full + 3 SWA-MLA with

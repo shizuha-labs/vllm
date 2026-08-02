@@ -10,6 +10,7 @@ from vllm import envs
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.metrics.stats import SchedulerStats
+from vllm.v1.core.sched.scheduler import _install_prefix_cache_recompute_floor
 
 
 assert envs.VLLM_RETENTION_BUDGET_FRAC == 0.5
@@ -85,4 +86,55 @@ assert sampling_params.extra_args["retention_directives"][0]["covers_prompt"]
 assert sampling_params.extra_args["retention_scope"].startswith("cortex:v1:")
 
 assert SchedulerStats().retention_metrics == {}
+
+
+class _PrefixStats:
+    def __init__(self):
+        self.calls = []
+
+    def record(self, **kwargs):
+        self.calls.append(kwargs)
+
+
+class _Coordinator:
+    def __init__(self):
+        self.max_lengths = []
+
+    def find_longest_cache_hit(self, block_hashes, max_length):
+        self.max_lengths.append(max_length)
+        return (["cached-block"],), max_length // 256 * 256
+
+
+class _Manager:
+    enable_caching = True
+    log_stats = True
+    empty_kv_cache_blocks = ((),)
+
+    def __init__(self):
+        self.coordinator = _Coordinator()
+        self.prefix_cache_stats = _PrefixStats()
+
+    @staticmethod
+    def create_kv_cache_blocks(blocks):
+        return blocks
+
+
+floor_manager = _Manager()
+_install_prefix_cache_recompute_floor(floor_manager, 2048)
+floor_request = SimpleNamespace(
+    num_tokens=60_000,
+    block_hashes=["hash"],
+    skip_reading_prefix_cache=False,
+    num_preemptions=0,
+)
+floor_blocks, floor_hit = floor_manager.get_computed_blocks(floor_request)
+assert floor_manager.coordinator.max_lengths == [57_952]
+assert floor_hit == 57_856
+assert 2_144 == floor_request.num_tokens - floor_hit
+assert floor_blocks == (["cached-block"],)
+assert floor_manager.prefix_cache_stats.calls == [{
+    "num_tokens": 60_000,
+    "num_hits": 57_856,
+    "preempted": False,
+}]
 print("RETENTION VENDOR GATE PASS")
