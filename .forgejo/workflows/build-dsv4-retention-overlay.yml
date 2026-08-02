@@ -40,6 +40,12 @@ jobs:
       - name: Static and CPU sidecar tests
         run: |
           set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          printf 'Acquire::http::Proxy "http://apt-cache.registry.svc.cluster.local:3142";\nAcquire::https::Proxy "DIRECT";\nAcquire::Retries "2";\n' \
+            >/etc/apt/apt.conf.d/01shizuha-cache
+          timeout 300s apt-get -o Acquire::http::Proxy=http://apt-cache.registry.svc.cluster.local:3142 update -qq
+          timeout 300s apt-get -o Acquire::http::Proxy=http://apt-cache.registry.svc.cluster.local:3142 \
+            install -y -qq --no-install-recommends python3-pytest
           DIR=overlays/plat4203-0.21.1-prefix-cache-retention
           python -m py_compile \
             "$DIR/vllm/envs.py" \
