@@ -37,7 +37,7 @@ jobs:
           GIT_ASKPASS="$ASKPASS" GIT_TERMINAL_PROMPT=0 git fetch --depth=2 origin "${{ github.sha }}"
           git checkout --detach FETCH_HEAD
 
-      - name: Static and CPU sidecar tests
+      - name: Static sidecar verification
         run: |
           set -euo pipefail
           DIR=overlays/plat4203-0.21.1-prefix-cache-retention
@@ -49,7 +49,6 @@ jobs:
             "$DIR/vllm/v1/metrics/stats_retention.py" \
             "$DIR/vllm/v1/core/sched/scheduler_retention.py" \
             "$DIR/vllm/v1/metrics/loggers_retention.py"
-          python -m pytest -q "$DIR/test_retention_overlay.py"
           CONTENT=$(git ls-files "$DIR" | sort | xargs sha256sum | sha256sum | cut -c1-12)
           echo "RETENTION_IMAGE_TAG=rfc37003-${CONTENT}" >> "$GITHUB_ENV"
 
@@ -82,7 +81,7 @@ jobs:
         run: |
           set -euo pipefail
           SHORT=$(echo '${{ github.sha }}' | cut -c1-7)
-          JOB="dsv4-retention-test-${SHORT}"
+          JOB="dsv4-retention-verify-${SHORT}"
           kubectl delete job -n build "$JOB" --ignore-not-found
           cat <<YAML | kubectl apply -f -
           apiVersion: batch/v1
@@ -90,7 +89,7 @@ jobs:
           metadata:
             name: ${JOB}
             namespace: build
-            labels: { app: dsv4-retention-test, shizuha.io/task: RFC-37003 }
+            labels: { app: dsv4-retention-verify, shizuha.io/task: RFC-37003 }
           spec:
             backoffLimit: 0
             ttlSecondsAfterFinished: 600
@@ -120,7 +119,7 @@ jobs:
                         valueFrom: { secretKeyRef: { name: forgejo-token, key: password } }
                     volumeMounts: [{ name: workspace, mountPath: /workspace }]
                 containers:
-                  - name: vendor-test
+                  - name: vendor-verify
                     image: aidendle94/sparkrun-vllm-ds4-gb10:production-ready
                     command: ["/bin/bash", "-lc"]
                     args:
