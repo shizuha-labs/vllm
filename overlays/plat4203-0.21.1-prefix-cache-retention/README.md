@@ -107,7 +107,8 @@ so the next turn finds no SWA cache hit and re-prefills the whole prompt.
 ## What this is
 
 A **pure-Python overlay** on top of the production sm121 image
-`aidendle94/sparkrun-vllm-ds4-gb10:production-ready` (vLLM `0.21.1rc1.dev339`,
+`aidendle94/sparkrun-vllm-ds4-gb10@sha256:f869281d869b2a1d418cade7dcbabe65216cb8f54891d5e2e50718c3dc8b630f`
+(vLLM `0.21.1rc1.dev339`,
 DeepSeek-V4 sparse-MLA sm121 kernels **compiled and unchanged**). No CUDA rebuild.
 It backports the core mechanism of upstream vLLM PR
 [#43447](https://github.com/vllm-project/vllm/pull/43447)
@@ -190,6 +191,8 @@ docker build --platform linux/arm64 -t gx10-1:30500/vllm-ds4-sm121:0.21.1-retent
 docker push gx10-1:30500/vllm-ds4-sm121:0.21.1-retention-<sha>
 ```
 COPY-only (no RUN) ⇒ no qemu needed to build the arm64 image on an amd64 host.
-In-cluster kaniko equivalent: mirror `cortex/.forgejo/scripts/run-ci-build-jobs.sh`
+The qualified base is recorded in `base.env`; source CI fails if it differs from
+the Dockerfile default. In-cluster kaniko equivalent: mirror
+`cortex/.forgejo/scripts/run-ci-build-jobs.sh`
 (arm64 nodeSelector, `--insecure --skip-tls-verify --insecure-pull`,
 dockerhub mirror for the base pull).

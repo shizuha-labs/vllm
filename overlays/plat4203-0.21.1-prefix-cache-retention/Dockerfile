@@ -4,7 +4,8 @@
 # drop (env-gated VLLM_DSV4_SINGLE_EAGLE_DROP, default OFF) to fix the DSV4
 # multi-group append-under-MTP 0-hit spiral (#42948). Pure Python overlay —
 # NO CUDA rebuild; sm121 sparse-MLA kernels untouched.
-FROM aidendle94/sparkrun-vllm-ds4-gb10:production-ready
+ARG VLLM_BASE_IMAGE=aidendle94/sparkrun-vllm-ds4-gb10@sha256:f869281d869b2a1d418cade7dcbabe65216cb8f54891d5e2e50718c3dc8b630f
+FROM ${VLLM_BASE_IMAGE}
 COPY vllm/envs.py /opt/env/lib/python3.12/site-packages/vllm/envs.py
 COPY vllm/v1/core/block_pool.py /opt/env/lib/python3.12/site-packages/vllm/v1/core/block_pool.py
 COPY vllm/v1/core/priority_eviction_queue.py /opt/env/lib/python3.12/site-packages/vllm/v1/core/priority_eviction_queue.py
