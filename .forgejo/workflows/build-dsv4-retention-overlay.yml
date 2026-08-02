@@ -11,7 +11,7 @@ on:
 
 concurrency:
   group: verify-dsv4-retention-source
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   verify-build:
@@ -88,6 +88,13 @@ jobs:
           CONTENT=$(git ls-files "$DIR" | sort | xargs sha256sum | sha256sum | cut -c1-12)
           JOB="ci-build-vllm-retention-${CONTENT}"
           IMAGE="registry.registry.svc.cluster.local:5000/vllm-ds4-sm121:rfc37003-${CONTENT}"
+          if curl --fail --silent --show-error \
+            -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+            "http://registry.registry.svc.cluster.local:5000/v2/vllm-ds4-sm121/manifests/rfc37003-${CONTENT}" \
+            >/dev/null; then
+            echo "reusing existing immutable image ${IMAGE}"
+            exit 0
+          fi
           kubectl delete job -n build "$JOB" --ignore-not-found
           cat <<YAML | kubectl apply -f -
           apiVersion: batch/v1
@@ -148,7 +155,12 @@ jobs:
           DIR=overlays/plat4203-0.21.1-prefix-cache-retention
           CONTENT=$(git ls-files "$DIR" | sort | xargs sha256sum | sha256sum | cut -c1-12)
           JOB="ci-verify-vllm-retention-${CONTENT}"
-          IMAGE="registry.registry.svc.cluster.local:5000/vllm-ds4-sm121:rfc37003-${CONTENT}"
+          EXPECTED_DIGEST=$(curl --fail --silent --show-error --head \
+            -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+            "http://registry.registry.svc.cluster.local:5000/v2/vllm-ds4-sm121/manifests/rfc37003-${CONTENT}" \
+            | awk 'tolower($1) == "docker-content-digest:" {gsub("\\r", "", $2); print $2}')
+          test -n "$EXPECTED_DIGEST"
+          IMAGE="localhost:30500/vllm-ds4-sm121:rfc37003-${CONTENT}@${EXPECTED_DIGEST}"
           kubectl delete job -n build "$JOB" --ignore-not-found
           cat <<YAML | kubectl apply -f -
           apiVersion: batch/v1
@@ -200,4 +212,10 @@ jobs:
             exit 1
           fi
           kubectl logs -n build "job/${JOB}" -c vendor-runtime-gate
-          echo "qualified image ${IMAGE}"
+          POD=$(kubectl get pods -n build -l "job-name=${JOB}" -o jsonpath='{.items[0].metadata.name}')
+          LIVE_IMAGE_ID=$(kubectl get pod -n build "$POD" -o jsonpath='{.status.containerStatuses[0].imageID}')
+          case "$LIVE_IMAGE_ID" in
+            *@${EXPECTED_DIGEST}) ;;
+            *) echo "unexpected live imageID: ${LIVE_IMAGE_ID}" >&2; exit 1 ;;
+          esac
+          echo "qualified image ${IMAGE} live_image_id=${LIVE_IMAGE_ID}"
