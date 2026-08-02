@@ -163,19 +163,30 @@ class PriorityEvictionQueue:
         heapq.heapify(self._heap)
 
     def release_expired(self) -> list[int]:
-        """Demote all expired candidates to ordinary LRU in one batch."""
+        """Expire all metadata and demote queued candidates in one batch.
+
+        A protected block may be suspended from the eviction queue while it is
+        referenced by an active request.  Its TTL still applies.  Scanning only
+        ``_in_queue`` left expired metadata attached to suspended blocks, which
+        could preserve stale scope ownership after the advertised TTL.  Clear
+        every expired metadata entry, but return only queued block ids: callers
+        must never append an active/suspended block to the free LRU.
+        """
         now = time.monotonic()
-        expired: list[tuple[float, int]] = []
-        for block_id in list(self._in_queue):
-            meta = self._meta.get(block_id)
-            if meta is not None and meta.expiry is not None and meta.expiry <= now:
-                self._in_queue.discard(block_id)
+        expired_queued: list[tuple[float, int]] = []
+        expired_count = 0
+        for block_id, meta in list(self._meta.items()):
+            if meta.expiry is not None and meta.expiry <= now:
+                expired_count += 1
                 self._meta.pop(block_id, None)
-                expired.append((meta.last_freed_time, block_id))
-        self.ttl_expiries_total += len(expired)
+                if block_id not in self._in_queue:
+                    continue
+                self._in_queue.discard(block_id)
+                expired_queued.append((meta.last_freed_time, block_id))
+        self.ttl_expiries_total += expired_count
         self._maybe_compact()
-        expired.sort()
-        return [block_id for _, block_id in expired]
+        expired_queued.sort()
+        return [block_id for _, block_id in expired_queued]
 
     def unprotect(self, block_id: int) -> None:
         self._meta.pop(block_id, None)

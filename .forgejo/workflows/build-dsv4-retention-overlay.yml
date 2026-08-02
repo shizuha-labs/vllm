@@ -57,5 +57,127 @@ jobs:
             "$DIR/vllm/v1/metrics/loggers_retention.py"
           grep -Fq ': vllm-timing ' "$DIR/diffs/frontend_timing.patch"
           grep -Fq 'engine_frontend_to_core_ms' "$DIR/diffs/frontend_timing.patch"
+          python -m pytest -q "$DIR/test_retention_overlay.py"
           CONTENT=$(git ls-files "$DIR" | sort | xargs sha256sum | sha256sum | cut -c1-12)
           echo "verified source content rfc37003-${CONTENT}"
+
+      - name: Build immutable ARM64 vendor overlay in cluster
+        run: |
+          set -euo pipefail
+          DIR=overlays/plat4203-0.21.1-prefix-cache-retention
+          CONTENT=$(git ls-files "$DIR" | sort | xargs sha256sum | sha256sum | cut -c1-12)
+          JOB="ci-build-vllm-retention-${CONTENT}"
+          IMAGE="registry.registry.svc.cluster.local:5000/vllm-ds4-sm121:rfc37003-${CONTENT}"
+          kubectl delete job -n build "$JOB" --ignore-not-found
+          cat <<YAML | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ${JOB}
+            namespace: build
+            labels: { app: ci-build, service: vllm-dsv4-retention }
+          spec:
+            backoffLimit: 1
+            ttlSecondsAfterFinished: 3600
+            template:
+              spec:
+                restartPolicy: Never
+                nodeSelector: { kubernetes.io/arch: arm64 }
+                tolerations:
+                  - { key: node.shizuha/workstation, operator: Exists, effect: NoSchedule }
+                  - { key: shizuha.com/inference-paused, operator: Exists, effect: NoSchedule }
+                initContainers:
+                  - name: git-clone
+                    image: alpine/git:2.43.0
+                    command: ["/bin/sh", "-c"]
+                    args:
+                      - |
+                        set -eu
+                        git clone --depth=20 http://x-token-auth:\${GIT_PASSWORD}@forgejo-http.origin.svc.cluster.local/shizuha-labs/vllm.git /workspace/src
+                        cd /workspace/src
+                        git fetch --depth=20 origin ${{ github.sha }}
+                        git checkout --detach ${{ github.sha }}
+                    env:
+                      - name: GIT_PASSWORD
+                        valueFrom: { secretKeyRef: { name: forgejo-token, key: password } }
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                containers:
+                  - name: kaniko
+                    image: gcr.io/kaniko-project/executor:v1.23.2
+                    args:
+                      - --context=dir:///workspace/src/${DIR}
+                      - --dockerfile=/workspace/src/${DIR}/Dockerfile
+                      - --destination=${IMAGE}
+                      - --insecure
+                      - --skip-tls-verify
+                      - --insecure-pull
+                      - --registry-mirror=mirror-dockerhub.registry.svc.cluster.local:5000
+                      - --cache=false
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                volumes: [{ emptyDir: {}, name: workspace }]
+          YAML
+          if ! kubectl wait -n build --for=condition=complete "job/${JOB}" --timeout=1800s; then
+            kubectl logs -n build "job/${JOB}" --all-containers --tail=120 || true
+            exit 1
+          fi
+          kubectl logs -n build "job/${JOB}" -c kaniko --tail=20
+
+      - name: Qualify exact published image in vendor runtime
+        run: |
+          set -euo pipefail
+          DIR=overlays/plat4203-0.21.1-prefix-cache-retention
+          CONTENT=$(git ls-files "$DIR" | sort | xargs sha256sum | sha256sum | cut -c1-12)
+          JOB="ci-verify-vllm-retention-${CONTENT}"
+          IMAGE="registry.registry.svc.cluster.local:5000/vllm-ds4-sm121:rfc37003-${CONTENT}"
+          kubectl delete job -n build "$JOB" --ignore-not-found
+          cat <<YAML | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ${JOB}
+            namespace: build
+            labels: { app: ci-verify, service: vllm-dsv4-retention }
+          spec:
+            backoffLimit: 0
+            ttlSecondsAfterFinished: 3600
+            template:
+              spec:
+                restartPolicy: Never
+                nodeSelector: { kubernetes.io/arch: arm64 }
+                tolerations:
+                  - { key: node.shizuha/workstation, operator: Exists, effect: NoSchedule }
+                  - { key: shizuha.com/inference-paused, operator: Exists, effect: NoSchedule }
+                initContainers:
+                  - name: git-clone
+                    image: alpine/git:2.43.0
+                    command: ["/bin/sh", "-c"]
+                    args:
+                      - |
+                        set -eu
+                        git clone --depth=20 http://x-token-auth:\${GIT_PASSWORD}@forgejo-http.origin.svc.cluster.local/shizuha-labs/vllm.git /workspace/src
+                        cd /workspace/src
+                        git fetch --depth=20 origin ${{ github.sha }}
+                        git checkout --detach ${{ github.sha }}
+                    env:
+                      - name: GIT_PASSWORD
+                        valueFrom: { secretKeyRef: { name: forgejo-token, key: password } }
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                containers:
+                  - name: vendor-runtime-gate
+                    image: ${IMAGE}
+                    imagePullPolicy: Always
+                    command: ["/bin/sh", "-lc"]
+                    args:
+                      - |
+                        set -eu
+                        /opt/env/bin/python /workspace/src/${DIR}/verify_retention_vendor.py
+                        /opt/env/bin/python /workspace/src/${DIR}/verify_hitfix.py
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                volumes: [{ emptyDir: {}, name: workspace }]
+          YAML
+          if ! kubectl wait -n build --for=condition=complete "job/${JOB}" --timeout=600s; then
+            kubectl logs -n build "job/${JOB}" --all-containers --tail=160 || true
+            exit 1
+          fi
+          kubectl logs -n build "job/${JOB}" -c vendor-runtime-gate
+          echo "qualified image ${IMAGE}"

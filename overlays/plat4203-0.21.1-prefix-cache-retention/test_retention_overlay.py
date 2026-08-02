@@ -128,6 +128,38 @@ def test_ttl_batch_demotion_and_metrics(monkeypatch):
     assert queue.metrics(2)["ttl_expiries_total"] == 1
 
 
+def test_ttl_clears_suspended_metadata_without_freeing_active_block(monkeypatch):
+    queue = PriorityEvictionQueue()
+    queued = _hashed_block(1)
+    suspended = _hashed_block(2)
+    live = _hashed_block(3)
+    monkeypatch.setattr(priority_module.time, "monotonic", lambda: 100.0)
+    _set_meta(queue, queued, 50, expiry=120.0, freed=20.0)
+    _set_meta(queue, suspended, 50, expiry=120.0, freed=10.0)
+    _set_meta(queue, live, 50, expiry=180.0, freed=30.0)
+    assert queue.try_insert(queued)
+    assert queue.try_insert(suspended)
+    assert queue.try_insert(live)
+    queue.suspend(suspended)
+
+    monkeypatch.setattr(priority_module.time, "monotonic", lambda: 150.0)
+    # Only the queued candidate is safe for BlockPool.get_new_blocks() to put
+    # back on the free LRU. The suspended block merely loses stale metadata.
+    assert queue.release_expired() == [queued.block_id]
+    assert suspended.block_id not in queue._meta
+    assert suspended.block_id not in queue._in_queue
+    assert live.block_id in queue._meta
+    assert live in queue
+    assert queue.metrics(3) == {
+        "protected_blocks": 1,
+        "queued_protected_blocks": 1,
+        "budget_blocks": 3,
+        "priority_evictions_total": 0,
+        "ttl_expiries_total": 2,
+        "budget_drops_total": 0,
+    }
+
+
 def test_scope_ownership_and_range_offset():
     queue = PriorityEvictionQueue()
     blocks = [_hashed_block(10), _hashed_block(11)]
