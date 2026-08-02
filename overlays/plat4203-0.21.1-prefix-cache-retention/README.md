@@ -79,7 +79,27 @@ was silent). Leave `VLLM_PREFIX_CACHE_RETENTION_INTERVAL` unset.
 
 ---
 
-## Retention half (below) — #43447 free-queue eviction ordering
+## RFC-37003 priority retention (additive, default off)
+
+This overlay also ports the request-scoped KV retention mechanism from the
+RFC-37003 candidate implementation. Cortex may send validated
+`retention_directives` plus an opaque `retention_scope`; `covers_prompt` is
+resolved to the exact prompt token interval in the engine. Protected blocks
+remain allocatable soft pins: ordinary LRU is consumed first, then the lowest
+priority and oldest protected block.
+
+`VLLM_RETENTION_BUDGET_FRAC` is the hard protected-pool ceiling and defaults to
+`0`, which is an exact operational opt-out. A canary must set a positive value
+explicitly. TTL expiry demotes blocks to LRU in a batch; requests beyond the
+budget also degrade to LRU and increment a drop counter. Metrics are exported
+as `vllm:retention_*` gauges/counters through the normal vLLM stats path.
+
+Origin CI runs sidecar tests, then the real request/protocol/BlockPool harness
+and the DSV4 hitfix harness inside the exact ARM64 vendor runtime before Kaniko
+publishes the immutable content-addressed image. No hand-built image is part of
+this path.
+
+## Baseline retention — #43447 free-queue eviction ordering
 
 Root cause of half 1: sliding-window KV prefix blocks are evicted between turns,
 so the next turn finds no SWA cache hit and re-prefills the whole prompt.

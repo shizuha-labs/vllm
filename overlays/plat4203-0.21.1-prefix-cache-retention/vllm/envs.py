@@ -281,6 +281,7 @@ if TYPE_CHECKING:
     VLLM_ELASTIC_EP_SCALE_UP_LAUNCH: bool = False
     VLLM_ELASTIC_EP_DRAIN_REQUESTS: bool = False
     VLLM_PREFIX_CACHE_RETENTION_INTERVAL: int | None = None
+    VLLM_RETENTION_BUDGET_FRAC: float = 0.0
     VLLM_DSV4_SINGLE_EAGLE_DROP: bool = False
     VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: bool = True
     VLLM_NIXL_EP_MAX_NUM_RANKS: int = 32
@@ -1043,6 +1044,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.environ["VLLM_PREFIX_CACHE_RETENTION_INTERVAL"])
         if "VLLM_PREFIX_CACHE_RETENTION_INTERVAL" in os.environ
         else None
+    ),
+    # RFC-37003 priority-retention budget. Default zero is an exact opt-out;
+    # the canary/production manifest must explicitly allocate a bounded share.
+    "VLLM_RETENTION_BUDGET_FRAC": lambda: float(
+        os.environ.get("VLLM_RETENTION_BUDGET_FRAC", "0")
     ),
     # PLAT-4203 hitfix (default OFF). When set, the HybridKVCacheCoordinator
     # finds the longest COMMON prefix hit with no per-group EAGLE drop and then

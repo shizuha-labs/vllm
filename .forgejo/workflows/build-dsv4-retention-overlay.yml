@@ -1,0 +1,258 @@
+name: build-dsv4-retention-overlay-arm64
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches:
+      - overlay/plat4203-0.21.1-prefix-cache-retention
+    paths:
+      - overlays/plat4203-0.21.1-prefix-cache-retention/**
+      - .forgejo/workflows/build-dsv4-retention-overlay.yml
+
+concurrency:
+  group: build-dsv4-retention-overlay-arm64
+  cancel-in-progress: false
+
+jobs:
+  verify-build:
+    runs-on: deploy-lane
+    steps:
+      - name: Checkout pinned commit from Origin
+        env:
+          GIT_PASSWORD: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ASKPASS=$(mktemp)
+          trap 'rm -f "$ASKPASS"' EXIT
+          cat >"$ASKPASS" <<'SH'
+          #!/bin/sh
+          case "$1" in
+            *Username*) printf '%s\n' x-token-auth ;;
+            *) printf '%s\n' "$GIT_PASSWORD" ;;
+          esac
+          SH
+          chmod 700 "$ASKPASS"
+          git init .
+          git remote add origin http://forgejo-http.origin.svc.cluster.local/shizuha-labs/vllm.git
+          GIT_ASKPASS="$ASKPASS" GIT_TERMINAL_PROMPT=0 git fetch --depth=2 origin "${{ github.sha }}"
+          git checkout --detach FETCH_HEAD
+
+      - name: Static and CPU sidecar tests
+        run: |
+          set -euo pipefail
+          DIR=overlays/plat4203-0.21.1-prefix-cache-retention
+          python -m py_compile \
+            "$DIR/vllm/envs.py" \
+            "$DIR/vllm/v1/core/block_pool.py" \
+            "$DIR/vllm/v1/core/priority_eviction_queue.py" \
+            "$DIR/vllm/entrypoints/openai/chat_completion/protocol_retention.py" \
+            "$DIR/vllm/v1/metrics/stats_retention.py" \
+            "$DIR/vllm/v1/core/sched/scheduler_retention.py" \
+            "$DIR/vllm/v1/metrics/loggers_retention.py"
+          python -m pytest -q "$DIR/test_retention_overlay.py"
+          CONTENT=$(git ls-files "$DIR" | sort | xargs sha256sum | sha256sum | cut -c1-12)
+          echo "RETENTION_IMAGE_TAG=rfc37003-${CONTENT}" >> "$GITHUB_ENV"
+
+      - name: Install kubectl and cluster access
+        env:
+          GIT_PASSWORD: ${{ secrets.ORIGIN_PACKAGE_TOKEN }}
+        run: |
+          set -euo pipefail
+          KUBECTL_ARCH=$(uname -m)
+          case "$KUBECTL_ARCH" in
+            x86_64) KUBECTL_ARCH=amd64; KUBECTL_SHA=7c81556ac1212213a07180f92eca57db8caef886e58bbad15e9dada10782c10d ;;
+            aarch64) KUBECTL_ARCH=arm64; KUBECTL_SHA=2695afc60eea47880ba71c9a01412693b2246c1c76623a352a727db566a6d8b5 ;;
+            *) echo "unsupported runner architecture: $KUBECTL_ARCH" >&2; exit 1 ;;
+          esac
+          AUTH_CONFIG=$(mktemp)
+          trap 'rm -f "$AUTH_CONFIG"' EXIT
+          chmod 600 "$AUTH_CONFIG"
+          printf 'header = "Authorization: token %s"\n' "$GIT_PASSWORD" > "$AUTH_CONFIG"
+          URL="http://forgejo-http.origin.svc.cluster.local/api/packages/shizuha-labs/generic/kubectl-k3s1/v1.34.6/kubectl-linux-${KUBECTL_ARCH}"
+          curl --config "$AUTH_CONFIG" --fail --location --silent --show-error \
+            --retry 3 --retry-all-errors --connect-timeout 10 --max-time 120 \
+            -o kubectl "$URL"
+          echo "$KUBECTL_SHA  kubectl" | sha256sum --check
+          install -m 0755 kubectl /usr/local/bin/kubectl
+          mkdir -p "$HOME/.kube"
+          printf '%s' "${{ secrets.KUBE_CONFIG_B64 }}" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+
+      - name: Verify exact overlay in ARM64 vendor runtime
+        run: |
+          set -euo pipefail
+          SHORT=$(echo '${{ github.sha }}' | cut -c1-7)
+          JOB="dsv4-retention-test-${SHORT}"
+          kubectl delete job -n build "$JOB" --ignore-not-found
+          cat <<YAML | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ${JOB}
+            namespace: build
+            labels: { app: dsv4-retention-test, shizuha.io/task: RFC-37003 }
+          spec:
+            backoffLimit: 0
+            ttlSecondsAfterFinished: 600
+            template:
+              spec:
+                restartPolicy: Never
+                nodeSelector:
+                  kubernetes.io/hostname: gx10-12
+                  kubernetes.io/arch: arm64
+                tolerations:
+                  - { key: node.shizuha/workstation, operator: Exists, effect: NoSchedule }
+                  - { key: shizuha.com/inference-paused, operator: Exists, effect: NoSchedule }
+                  - { key: vllm-dedicated, operator: Exists, effect: NoSchedule }
+                initContainers:
+                  - name: git-clone
+                    image: alpine/git:2.43.0
+                    command: ["/bin/sh", "-c"]
+                    args:
+                      - |
+                        set -eu
+                        git clone --no-checkout http://x-token-auth:\${GIT_PASSWORD}@forgejo-http.origin.svc.cluster.local/shizuha-labs/vllm.git /workspace/src
+                        cd /workspace/src
+                        git fetch --depth=1 origin ${{ github.sha }}
+                        git checkout --detach ${{ github.sha }}
+                    env:
+                      - name: GIT_PASSWORD
+                        valueFrom: { secretKeyRef: { name: forgejo-token, key: password } }
+                    volumeMounts: [{ name: workspace, mountPath: /workspace }]
+                containers:
+                  - name: vendor-test
+                    image: aidendle94/sparkrun-vllm-ds4-gb10:production-ready
+                    command: ["/bin/bash", "-lc"]
+                    args:
+                      - |
+                        set -euo pipefail
+                        DIR=/workspace/src/overlays/plat4203-0.21.1-prefix-cache-retention
+                        SITE=/opt/env/lib/python3.12/site-packages/vllm
+                        cp "\${SITE}/entrypoints/openai/chat_completion/protocol.py" "\${SITE}/entrypoints/openai/chat_completion/protocol_base.py"
+                        cp "\${SITE}/v1/metrics/stats.py" "\${SITE}/v1/metrics/stats_base.py"
+                        cp "\${SITE}/v1/core/sched/scheduler.py" "\${SITE}/v1/core/sched/scheduler_base.py"
+                        cp "\${SITE}/v1/metrics/loggers.py" "\${SITE}/v1/metrics/loggers_base.py"
+                        cp "\${DIR}/vllm/envs.py" "\${SITE}/envs.py"
+                        cp "\${DIR}/vllm/v1/core/block_pool.py" "\${SITE}/v1/core/block_pool.py"
+                        cp "\${DIR}/vllm/v1/core/priority_eviction_queue.py" "\${SITE}/v1/core/priority_eviction_queue.py"
+                        cp "\${DIR}/vllm/v1/core/kv_cache_utils.py" "\${SITE}/v1/core/kv_cache_utils.py"
+                        cp "\${DIR}/vllm/v1/core/single_type_kv_cache_manager.py" "\${SITE}/v1/core/single_type_kv_cache_manager.py"
+                        cp "\${DIR}/vllm/v1/core/kv_cache_coordinator.py" "\${SITE}/v1/core/kv_cache_coordinator.py"
+                        cp "\${DIR}/vllm/entrypoints/openai/chat_completion/protocol_retention.py" "\${SITE}/entrypoints/openai/chat_completion/protocol.py"
+                        cp "\${DIR}/vllm/v1/metrics/stats_retention.py" "\${SITE}/v1/metrics/stats.py"
+                        cp "\${DIR}/vllm/v1/core/sched/scheduler_retention.py" "\${SITE}/v1/core/sched/scheduler.py"
+                        cp "\${DIR}/vllm/v1/metrics/loggers_retention.py" "\${SITE}/v1/metrics/loggers.py"
+                        /opt/env/bin/python "\${DIR}/verify_retention_vendor.py"
+                        /opt/env/bin/python "\${DIR}/verify_hitfix.py"
+                    resources:
+                      requests: { cpu: "2", memory: 4Gi }
+                      limits: { memory: 16Gi }
+                    volumeMounts: [{ name: workspace, mountPath: /workspace }]
+                volumes: [{ name: workspace, emptyDir: {} }]
+          YAML
+          kubectl wait -n build --for=condition=complete "job/${JOB}" --timeout=900s || {
+            kubectl logs -n build "job/${JOB}" --all-containers --tail=300 || true
+            exit 1
+          }
+          kubectl logs -n build "job/${JOB}" --all-containers --tail=300
+
+      - name: Build immutable ARM64 retention runtime
+        run: |
+          set -euo pipefail
+          SHORT=$(echo '${{ github.sha }}' | cut -c1-7)
+          JOB="dsv4-retention-build-${SHORT}"
+          REG=registry.registry.svc.cluster.local:5000
+          IMAGE="${REG}/vllm-ds4-sm121:${RETENTION_IMAGE_TAG}"
+          kubectl delete job -n build "$JOB" --ignore-not-found
+          cat <<YAML | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ${JOB}
+            namespace: build
+            labels: { app: dsv4-retention-build, shizuha.io/task: RFC-37003 }
+          spec:
+            backoffLimit: 1
+            ttlSecondsAfterFinished: 600
+            template:
+              spec:
+                restartPolicy: Never
+                nodeSelector:
+                  kubernetes.io/hostname: gx10-12
+                  kubernetes.io/arch: arm64
+                tolerations:
+                  - { key: node.shizuha/workstation, operator: Exists, effect: NoSchedule }
+                  - { key: shizuha.com/inference-paused, operator: Exists, effect: NoSchedule }
+                  - { key: vllm-dedicated, operator: Exists, effect: NoSchedule }
+                initContainers:
+                  - name: git-clone
+                    image: alpine/git:2.43.0
+                    command: ["/bin/sh", "-c"]
+                    args:
+                      - |
+                        set -eu
+                        git clone --no-checkout http://x-token-auth:\${GIT_PASSWORD}@forgejo-http.origin.svc.cluster.local/shizuha-labs/vllm.git /workspace/src
+                        cd /workspace/src
+                        git fetch --depth=1 origin ${{ github.sha }}
+                        git checkout --detach ${{ github.sha }}
+                    env:
+                      - name: GIT_PASSWORD
+                        valueFrom: { secretKeyRef: { name: forgejo-token, key: password } }
+                    volumeMounts: [{ name: workspace, mountPath: /workspace }]
+                containers:
+                  - name: kaniko
+                    image: gcr.io/kaniko-project/executor:v1.23.2
+                    args:
+                      - --context=dir:///workspace/src/overlays/plat4203-0.21.1-prefix-cache-retention
+                      - --dockerfile=/workspace/src/overlays/plat4203-0.21.1-prefix-cache-retention/Dockerfile
+                      - --destination=${IMAGE}
+                      - --cleanup
+                      - --insecure
+                      - --skip-tls-verify
+                      - --insecure-pull
+                      - --registry-mirror=mirror-dockerhub.registry.svc.cluster.local:5000
+                      - --cache=true
+                      - --cache-repo=${REG}/kaniko-cache/dsv4-retention-arm64
+                      - --cache-copy-layers=true
+                      - --cache-ttl=336h
+                      - --compressed-caching=false
+                    resources:
+                      requests: { cpu: "2", memory: 4Gi }
+                      limits: { memory: 16Gi }
+                    volumeMounts: [{ name: workspace, mountPath: /workspace }]
+                volumes: [{ name: workspace, emptyDir: {} }]
+          YAML
+          kubectl wait -n build --for=condition=complete "job/${JOB}" --timeout=3600s || {
+            kubectl logs -n build "job/${JOB}" --all-containers --tail=300 || true
+            exit 1
+          }
+          echo "published ${IMAGE}"
+
+      - name: Verify registry digest and ARM64 config
+        run: |
+          set -euo pipefail
+          export RETENTION_IMAGE_TAG
+          python - <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          root = "http://registry.registry.svc.cluster.local:5000"
+          repo = "vllm-ds4-sm121"
+          tag = os.environ["RETENTION_IMAGE_TAG"]
+          request = urllib.request.Request(
+              f"{root}/v2/{repo}/manifests/{tag}",
+              headers={"Accept": "application/vnd.oci.image.manifest.v1+json"},
+          )
+          with urllib.request.urlopen(request, timeout=30) as response:
+              manifest = json.load(response)
+              digest = response.headers.get("Docker-Content-Digest")
+          config_digest = manifest["config"]["digest"]
+          with urllib.request.urlopen(
+              f"{root}/v2/{repo}/blobs/{config_digest}", timeout=30
+          ) as response:
+              config = json.load(response)
+          assert config["architecture"] == "arm64", config
+          assert digest and digest.startswith("sha256:"), digest
+          print(f"verified {repo}:{tag} digest={digest} arch=arm64")
+          PY

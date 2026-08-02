@@ -1,0 +1,172 @@
+# SPDX-License-Identifier: Apache-2.0
+
+import importlib.util
+import shutil
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from types import ModuleType
+
+import pytest
+
+HERE = Path(__file__).parent
+
+
+@dataclass
+class KVCacheBlock:
+    block_id: int
+    ref_cnt: int = 0
+    block_hash: bytes | None = None
+    is_null: bool = False
+
+
+kv_utils_stub = ModuleType("vllm.v1.core.kv_cache_utils")
+kv_utils_stub.KVCacheBlock = KVCacheBlock
+sys.modules["vllm.v1.core.kv_cache_utils"] = kv_utils_stub
+
+
+def _load_module(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+priority_module = _load_module(
+    "vllm.v1.core.priority_eviction_queue",
+    HERE / "vllm/v1/core/priority_eviction_queue.py",
+)
+PriorityEvictionQueue = priority_module.PriorityEvictionQueue
+RetentionMeta = priority_module.RetentionMeta
+
+
+def _hashed_block(block_id: int) -> KVCacheBlock:
+    block = KVCacheBlock(block_id)
+    block.block_hash = b"hash" + block_id.to_bytes(4, "big")
+    return block
+
+
+def _set_meta(queue, block, priority, *, expiry=None, scope=None, freed=0.0):
+    queue._meta[block.block_id] = RetentionMeta(
+        priority=priority,
+        expiry=expiry,
+        scope=scope,
+        last_freed_time=freed,
+    )
+
+
+def test_priority_and_generation_ordering():
+    queue = PriorityEvictionQueue()
+    low = _hashed_block(1)
+    high = _hashed_block(2)
+    _set_meta(queue, low, 20)
+    _set_meta(queue, high, 80)
+    queue.try_insert(low, 100.0)
+    queue.try_insert(high, 200.0)
+    assert queue.pop_lowest() is low
+
+    queue.suspend(high)
+    _set_meta(queue, high, 90)
+    queue.try_insert(high, 300.0)
+    middle = _hashed_block(3)
+    _set_meta(queue, middle, 70)
+    queue.try_insert(middle, 250.0)
+    assert queue.pop_lowest() is middle
+    assert queue.pop_lowest() is high
+    assert queue.metrics(4)["priority_evictions_total"] == 3
+
+
+def test_ttl_batch_demotion_and_metrics(monkeypatch):
+    queue = PriorityEvictionQueue()
+    expired = _hashed_block(1)
+    live = _hashed_block(2)
+    monkeypatch.setattr(priority_module.time, "monotonic", lambda: 100.0)
+    _set_meta(queue, expired, 50, expiry=120.0)
+    _set_meta(queue, live, 50, expiry=180.0)
+    queue.try_insert(expired)
+    queue.try_insert(live)
+    monkeypatch.setattr(priority_module.time, "monotonic", lambda: 150.0)
+    assert queue.release_expired() == [expired.block_id]
+    assert queue.pop_lowest() is live
+    assert queue.metrics(2)["ttl_expiries_total"] == 1
+
+
+def test_scope_ownership_and_range_offset():
+    queue = PriorityEvictionQueue()
+    blocks = [_hashed_block(10), _hashed_block(11)]
+    queue.apply_directives(
+        blocks,
+        [{"start": 32, "end": 48, "priority": 70}],
+        "alice",
+        block_size=16,
+        start_block_index=2,
+    )
+    assert queue._meta[10].priority == 70
+    assert 11 not in queue._meta
+    queue.apply_directives(
+        blocks[:1],
+        [{"start": 32, "end": 48, "priority": 20}],
+        "bob",
+        block_size=16,
+        start_block_index=2,
+    )
+    assert queue._meta[10].priority == 70
+    queue.apply_directives(
+        blocks[:1],
+        [{"start": 32, "end": 48, "priority": 20}],
+        "alice",
+        block_size=16,
+        start_block_index=2,
+    )
+    assert queue._meta[10].priority == 20
+
+
+def test_block_pool_wires_all_retention_lifecycle_paths():
+    source = (HERE / "vllm/v1/core/block_pool.py").read_text()
+    assert "if num_cached_blocks >= num_full_blocks:" in source
+    assert source.count("self._apply_retention_hook(") == 2
+    assert 'directive.get("covers_prompt")' in source
+    assert "release_expired()" in source
+    assert "pq.record_budget_drop" in source
+    assert "self.priority_eviction_queue.suspend(block)" in source
+    assert "self.priority_eviction_queue.drain()" in source
+    assert "+ self.priority_eviction_queue.num_blocks" in source
+
+
+def test_protocol_fields_validation_and_sampling_round_trip(tmp_path):
+    try:
+        import vllm._C  # noqa: F401
+    except ModuleNotFoundError:
+        pytest.skip("full protocol validation runs in the vendor-image CI gate")
+    protocol_dir = tmp_path / "chat_completion"
+    protocol_dir.mkdir()
+    shutil.copyfile(
+        Path("vllm/entrypoints/openai/chat_completion/protocol.py"),
+        protocol_dir / "protocol_base.py",
+    )
+    shutil.copyfile(
+        HERE / "vllm/entrypoints/openai/chat_completion/protocol_retention.py",
+        protocol_dir / "protocol.py",
+    )
+    module = _load_module("retention_protocol_test", protocol_dir / "protocol.py")
+    request = module.ChatCompletionRequest(
+        model="dummy",
+        messages=[{"role": "user", "content": "hi"}],
+        retention_directives=[{"covers_prompt": True, "priority": 90, "duration": 300}],
+        retention_scope="cortex:v1:" + "b" * 64,
+    )
+    params = request.to_sampling_params(16, {})
+    assert params.extra_args["retention_directives"][0]["covers_prompt"] is True
+    assert params.extra_args["retention_scope"].startswith("cortex:v1:")
+
+    with pytest.raises(ValueError, match="non-increasing"):
+        module.ChatCompletionRequest(
+            model="dummy",
+            messages=[{"role": "user", "content": "hi"}],
+            retention_directives=[
+                {"start": 0, "end": 16, "priority": 20},
+                {"start": 16, "end": 32, "priority": 90},
+            ],
+        )
