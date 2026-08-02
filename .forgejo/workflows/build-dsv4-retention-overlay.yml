@@ -57,9 +57,35 @@ jobs:
             "$DIR/vllm/v1/metrics/loggers_retention.py"
           grep -Fq ': vllm-timing ' "$DIR/diffs/frontend_timing.patch"
           grep -Fq 'engine_frontend_to_core_ms' "$DIR/diffs/frontend_timing.patch"
+          python -m pip install --disable-pip-version-check --no-input 'pytest==8.4.1'
           python -m pytest -q "$DIR/test_retention_overlay.py"
           CONTENT=$(git ls-files "$DIR" | sort | xargs sha256sum | sha256sum | cut -c1-12)
           echo "verified source content rfc37003-${CONTENT}"
+
+      - name: Install pinned kubectl and cluster access
+        env:
+          PACKAGE_TOKEN: ${{ secrets.ORIGIN_PACKAGE_TOKEN }}
+        run: |
+          set -euo pipefail
+          KUBECTL_ARCH=$(uname -m)
+          case "$KUBECTL_ARCH" in
+            x86_64) KUBECTL_ARCH=amd64; KUBECTL_SHA=7c81556ac1212213a07180f92eca57db8caef886e58bbad15e9dada10782c10d ;;
+            aarch64) KUBECTL_ARCH=arm64; KUBECTL_SHA=2695afc60eea47880ba71c9a01412693b2246c1c76623a352a727db566a6d8b5 ;;
+            *) echo "unsupported runner architecture: $KUBECTL_ARCH" >&2; exit 1 ;;
+          esac
+          AUTH_CONFIG=$(mktemp)
+          trap 'rm -f "$AUTH_CONFIG"' EXIT
+          chmod 600 "$AUTH_CONFIG"
+          printf 'header = "Authorization: token %s"\n' "$PACKAGE_TOKEN" > "$AUTH_CONFIG"
+          URL="http://forgejo-http.origin.svc.cluster.local/api/packages/shizuha-labs/generic/kubectl-k3s1/v1.34.6/kubectl-linux-${KUBECTL_ARCH}"
+          curl --config "$AUTH_CONFIG" --fail --location --silent --show-error \
+            --retry 3 --retry-all-errors --connect-timeout 10 --max-time 120 \
+            -o kubectl "$URL"
+          echo "$KUBECTL_SHA  kubectl" | sha256sum --check
+          install -m 0755 kubectl /usr/local/bin/kubectl
+          mkdir -p "$HOME/.kube"
+          printf '%s' '${{ secrets.KUBE_CONFIG_B64 }}' | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
 
       - name: Build immutable ARM64 vendor overlay in cluster
         run: |
