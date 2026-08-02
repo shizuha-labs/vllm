@@ -517,12 +517,15 @@ class BlockPool:
             if block.ref_cnt != 0 or block.is_null:
                 continue
             pq = self.priority_eviction_queue
-            if pq.num_blocks < self.retention_budget_blocks and pq.try_insert(
-                block, last_freed_time=freed_at + position * 1e-9
-            ):
+            admitted, displaced = pq.admit(
+                block,
+                self.retention_budget_blocks,
+                last_freed_time=freed_at + position * 1e-9,
+            )
+            if displaced is not None:
+                freed_blocks.append(displaced)
+            if admitted:
                 continue
-            if pq.has_metadata(block.block_id):
-                pq.record_budget_drop(block.block_id)
             freed_blocks.append(block)
         if prepend:
             self.free_block_queue.prepend_n(freed_blocks)

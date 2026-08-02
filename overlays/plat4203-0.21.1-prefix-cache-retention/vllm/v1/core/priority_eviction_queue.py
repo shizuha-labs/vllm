@@ -23,6 +23,8 @@ class RetentionMeta:
 
 
 class PriorityEvictionQueue:
+    _COMPACTION_FLOOR = 64
+
     def __init__(self) -> None:
         self._meta: dict[int, RetentionMeta] = {}
         self._heap: list[tuple[int, float, int, int, KVCacheBlock]] = []
@@ -73,14 +75,57 @@ class PriorityEvictionQueue:
             ),
         )
         self._in_queue.add(block.block_id)
+        self._maybe_compact()
         return True
+
+    def admit(
+        self,
+        block: KVCacheBlock,
+        budget_blocks: int,
+        last_freed_time: float,
+    ) -> tuple[bool, KVCacheBlock | None]:
+        """Admit a protected candidate, displacing only lower priority.
+
+        Returns ``(admitted, displaced_block)``. At equal priority the queued
+        incumbent wins, preserving its established LRU position.
+        """
+        meta = self._meta.get(block.block_id)
+        if meta is None:
+            return False, None
+        if meta.expiry is not None and meta.expiry <= time.monotonic():
+            self._meta.pop(block.block_id, None)
+            self.ttl_expiries_total += 1
+            return False, None
+        if budget_blocks <= 0:
+            self.record_budget_drop(block.block_id)
+            return False, None
+        if self.num_blocks < budget_blocks:
+            return self.try_insert(block, last_freed_time), None
+
+        lowest = self._peek_lowest()
+        assert lowest is not None, "non-empty priority queue has no live heap entry"
+        lowest_priority, incumbent = lowest
+        if meta.priority <= lowest_priority:
+            self.record_budget_drop(block.block_id)
+            return False, None
+
+        displaced = self._pop_lowest(count_eviction=False)
+        assert displaced is incumbent
+        self.budget_drops_total += 1
+        admitted = self.try_insert(block, last_freed_time)
+        assert admitted
+        return True, displaced
 
     def suspend(self, block: KVCacheBlock) -> None:
         """Remove an active eviction candidate but retain its protection."""
         self._in_queue.discard(block.block_id)
+        self._maybe_compact()
 
     def pop_lowest(self) -> KVCacheBlock | None:
         """Return the lowest-priority, least-recently-freed protected block."""
+        return self._pop_lowest(count_eviction=True)
+
+    def _pop_lowest(self, count_eviction: bool) -> KVCacheBlock | None:
         while self._heap:
             _, _, generation, block_id, block = heapq.heappop(self._heap)
             if block_id not in self._in_queue:
@@ -89,9 +134,33 @@ class PriorityEvictionQueue:
                 continue
             self._in_queue.discard(block_id)
             self._meta.pop(block_id, None)
-            self.priority_evictions_total += 1
+            if count_eviction:
+                self.priority_evictions_total += 1
+            self._maybe_compact()
             return block
         return None
+
+    def _peek_lowest(self) -> tuple[int, KVCacheBlock] | None:
+        while self._heap:
+            priority, _, generation, block_id, block = self._heap[0]
+            if block_id in self._in_queue and generation == self._generation.get(
+                block_id
+            ):
+                return priority, block
+            heapq.heappop(self._heap)
+        return None
+
+    def _maybe_compact(self) -> None:
+        """Bound lazy-deletion tombstones to O(live candidates + floor)."""
+        limit = max(self._COMPACTION_FLOOR, self.num_blocks * 2 + 16)
+        if len(self._heap) <= limit:
+            return
+        self._heap = [
+            entry
+            for entry in self._heap
+            if entry[3] in self._in_queue and entry[2] == self._generation.get(entry[3])
+        ]
+        heapq.heapify(self._heap)
 
     def release_expired(self) -> list[int]:
         """Demote all expired candidates to ordinary LRU in one batch."""
@@ -104,6 +173,7 @@ class PriorityEvictionQueue:
                 self._meta.pop(block_id, None)
                 expired.append((meta.last_freed_time, block_id))
         self.ttl_expiries_total += len(expired)
+        self._maybe_compact()
         expired.sort()
         return [block_id for _, block_id in expired]
 

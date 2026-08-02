@@ -57,6 +57,23 @@ budget_zero_pool.free_blocks([block])
 assert budget_zero_pool.priority_eviction_queue.num_blocks == 0
 assert budget_zero_pool.get_retention_metrics()["budget_drops_total"] == 1
 
+os.environ["VLLM_RETENTION_BUDGET_FRAC"] = "0.25"
+budget_pool = BlockPool(5, True, 16)
+low, high = budget_pool.get_new_blocks(2)
+for item in (low, high):
+    item.block_hash = b"budget01" + item.block_id.to_bytes(4, "big")
+budget_pool.priority_eviction_queue.apply_directives(
+    [low], [{"start": 0, "end": 16, "priority": 20}], "low", 16
+)
+budget_pool.free_blocks([low])
+budget_pool.priority_eviction_queue.apply_directives(
+    [high], [{"start": 0, "end": 16, "priority": 90}], "high", 16
+)
+budget_pool.free_blocks([high])
+assert high in budget_pool.priority_eviction_queue
+assert low not in budget_pool.priority_eviction_queue
+assert budget_pool.get_retention_metrics()["budget_drops_total"] == 1
+
 chat_request = ChatCompletionRequest(
     model="dummy",
     messages=[{"role": "user", "content": "hi"}],

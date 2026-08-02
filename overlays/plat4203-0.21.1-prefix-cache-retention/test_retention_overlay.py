@@ -78,6 +78,41 @@ def test_priority_and_generation_ordering():
     assert queue.metrics(4)["priority_evictions_total"] == 3
 
 
+def test_heap_tombstones_are_bounded_across_long_reuse_cycle():
+    queue = PriorityEvictionQueue()
+    block = _hashed_block(1)
+    _set_meta(queue, block, 90)
+    for freed_at in range(10_000):
+        assert queue.try_insert(block, float(freed_at))
+        queue.suspend(block)
+    assert len(queue._heap) <= queue._COMPACTION_FLOOR
+    assert queue.try_insert(block, 10_001.0)
+    assert queue.pop_lowest() is block
+
+
+def test_budget_admission_displaces_only_lower_priority():
+    queue = PriorityEvictionQueue()
+    incumbent = _hashed_block(1)
+    higher = _hashed_block(2)
+    equal = _hashed_block(3)
+    _set_meta(queue, incumbent, 20)
+    _set_meta(queue, higher, 90)
+    _set_meta(queue, equal, 90)
+
+    assert queue.admit(incumbent, 1, 100.0) == (True, None)
+    admitted, displaced = queue.admit(higher, 1, 200.0)
+    assert admitted is True
+    assert displaced is incumbent
+    assert higher in queue
+    assert queue.metrics(1)["budget_drops_total"] == 1
+
+    admitted, displaced = queue.admit(equal, 1, 300.0)
+    assert admitted is False
+    assert displaced is None
+    assert higher in queue
+    assert queue.metrics(1)["budget_drops_total"] == 2
+
+
 def test_ttl_batch_demotion_and_metrics(monkeypatch):
     queue = PriorityEvictionQueue()
     expired = _hashed_block(1)
@@ -129,7 +164,7 @@ def test_block_pool_wires_all_retention_lifecycle_paths():
     assert source.count("self._apply_retention_hook(") == 2
     assert 'directive.get("covers_prompt")' in source
     assert "release_expired()" in source
-    assert "pq.record_budget_drop" in source
+    assert "admitted, displaced = pq.admit(" in source
     assert "self.priority_eviction_queue.suspend(block)" in source
     assert "self.priority_eviction_queue.drain()" in source
     assert "+ self.priority_eviction_queue.num_blocks" in source
