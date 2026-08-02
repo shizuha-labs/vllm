@@ -47,6 +47,7 @@ jobs:
           test "$(grep -c '^FROM ' "$DIR/Dockerfile")" -eq 1
           grep -Fqx 'FROM ${VLLM_BASE_IMAGE}' "$DIR/Dockerfile"
           python -m py_compile \
+            "$DIR/apply_unified_overlay.py" \
             "$DIR/vllm/envs.py" \
             "$DIR/vllm/v1/core/block_pool.py" \
             "$DIR/vllm/v1/core/priority_eviction_queue.py" \
@@ -54,5 +55,7 @@ jobs:
             "$DIR/vllm/v1/metrics/stats_retention.py" \
             "$DIR/vllm/v1/core/sched/scheduler_retention.py" \
             "$DIR/vllm/v1/metrics/loggers_retention.py"
+          grep -Fq ': vllm-timing ' "$DIR/diffs/frontend_timing.patch"
+          grep -Fq 'engine_frontend_to_core_ms' "$DIR/diffs/frontend_timing.patch"
           CONTENT=$(git ls-files "$DIR" | sort | xargs sha256sum | sha256sum | cut -c1-12)
           echo "verified source content rfc37003-${CONTENT}"

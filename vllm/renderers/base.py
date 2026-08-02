@@ -1023,6 +1023,7 @@ class BaseRenderer(ABC, Generic[_T]):
         *,
         prompt_extras: dict[str, Any] | None = None,
         skip_mm_cache: bool = False,
+        stage_timings: dict[str, float] | None = None,
     ):
         arrival_time = time.time()
 
@@ -1034,16 +1035,27 @@ class BaseRenderer(ABC, Generic[_T]):
             for conversation in conversations
         ]
 
+        render_started = time.perf_counter()
         out_conversations = list[list["ConversationMessage"]]()
         dict_prompts = list[DictPrompt]()
         for conv, prompt in await asyncio.gather(*rendered):
             out_conversations.append(conv)
             dict_prompts.append(prompt)
+        if stage_timings is not None:
+            stage_timings["chat_template_ms"] = (
+                time.perf_counter() - render_started
+            ) * 1000.0
 
+        tokenize_started = time.perf_counter()
         tok_prompts = await self.tokenize_prompts_async(dict_prompts, tok_params)
+        if stage_timings is not None:
+            stage_timings["tokenization_ms"] = (
+                time.perf_counter() - tokenize_started
+            ) * 1000.0
 
         self._apply_prompt_extras(tok_prompts, prompt_extras)
 
+        engine_input_started = time.perf_counter()
         eng_prompts = await asyncio.gather(
             *(
                 self.process_for_engine_async(
@@ -1052,5 +1064,9 @@ class BaseRenderer(ABC, Generic[_T]):
                 for p in tok_prompts
             )
         )
+        if stage_timings is not None:
+            stage_timings["engine_input_ms"] = (
+                time.perf_counter() - engine_input_started
+            ) * 1000.0
 
         return out_conversations, eng_prompts

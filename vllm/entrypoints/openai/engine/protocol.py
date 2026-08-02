@@ -113,6 +113,10 @@ class UsageInfo(OpenAIBaseModel):
 class RequestResponseMetadata(BaseModel):
     request_id: str
     final_usage_info: UsageInfo | None = None
+    # Per-request API/frontend stage timings. Kept off the public response
+    # schema; chat routing exports the bounded values through the first SSE
+    # timing comment for end-to-end attribution.
+    frontend_timing: dict[str, float] = Field(default_factory=dict)
 
 
 class JsonSchemaResponseFormat(OpenAIBaseModel):

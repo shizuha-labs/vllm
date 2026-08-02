@@ -1,0 +1,266 @@
+diff --git a/vllm/entrypoints/openai/chat_completion/serving.py b/vllm/entrypoints/openai/chat_completion/serving.py
+--- a/vllm/entrypoints/openai/chat_completion/serving.py
++++ b/vllm/entrypoints/openai/chat_completion/serving.py
+@@ -196,6 +196,7 @@ class OpenAIServingChat(OpenAIServing):
+     async def render_chat_request(
+         self,
+         request: ChatCompletionRequest,
++        stage_timings: dict[str, float] | None = None,
+     ) -> tuple[list[ConversationMessage], list[EngineInput]] | ErrorResponse:
+         """
+         Validate the model and preprocess a chat completion request.
+@@ -207,7 +208,12 @@ class OpenAIServingChat(OpenAIServing):
+             A tuple of (conversation, engine_inputs) on success,
+             or an ErrorResponse on failure.
+         """
++        model_check_started = time.perf_counter()
+         error_check_ret = await self._check_model(request)
++        if stage_timings is not None:
++            stage_timings["model_check_ms"] = (
++                time.perf_counter() - model_check_started
++            ) * 1000.0
+         if error_check_ret is not None:
+             logger.error("Error with model %s", error_check_ret)
+             return error_check_ret
+@@ -218,7 +224,9 @@ class OpenAIServingChat(OpenAIServing):
+         if self.engine_client.errored:
+             raise self.engine_client.dead_error
+ 
+-        return await self.openai_serving_render.render_chat(request)
++        return await self.openai_serving_render.render_chat(
++            request, stage_timings=stage_timings
++        )
+ 
+     async def create_chat_completion(
+         self,
+@@ -241,9 +249,20 @@ class OpenAIServingChat(OpenAIServing):
+         request: ChatCompletionRequest,
+         raw_request: Request | None = None,
+     ) -> AsyncGenerator[str, None] | ChatCompletionResponse | ErrorResponse:
++        frontend_started = time.perf_counter()
++        request_id = (
++            f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
++        )
++        request_metadata = RequestResponseMetadata(request_id=request_id)
++        if raw_request:
++            # Publish the propagated ID before rendering so errors and slow
++            # frontend stages remain attributable to the inbound request.
++            raw_request.state.request_metadata = request_metadata
++
+         # Streaming response
+         tokenizer = self.renderer.tokenizer
+         assert tokenizer is not None
++        setup_started = time.perf_counter()
+         chat_template_kwargs = self._effective_chat_template_kwargs(request)
+         reasoning_parser: ReasoningParser | None = None
+         if self.reasoning_parser_cls:
+@@ -251,20 +270,20 @@ class OpenAIServingChat(OpenAIServing):
+                 tokenizer,
+                 chat_template_kwargs=chat_template_kwargs,  # type: ignore[call-arg]
+             )
+-        result = await self.render_chat_request(request)
++        request_metadata.frontend_timing["request_setup_ms"] = (
++            time.perf_counter() - setup_started
++        ) * 1000.0
++        result = await self.render_chat_request(
++            request, stage_timings=request_metadata.frontend_timing
++        )
++        request_metadata.frontend_timing["frontend_total_ms"] = (
++            time.perf_counter() - frontend_started
++        ) * 1000.0
+         if isinstance(result, ErrorResponse):
+             return result
+ 
+         conversation, engine_inputs = result
+ 
+-        request_id = (
+-            f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
+-        )
+-
+-        request_metadata = RequestResponseMetadata(request_id=request_id)
+-        if raw_request:
+-            raw_request.state.request_metadata = request_metadata
+-
+         lora_request = self._maybe_get_adapters(request, supports_default_mm_loras=True)
+ 
+         model_name = self.models.model_name(lora_request)
+@@ -510,6 +529,49 @@ class OpenAIServingChat(OpenAIServing):
+                 # response (by the try...catch).
+                 if first_iteration:
+                     num_cached_tokens = res.num_cached_tokens
++                    timing: dict[str, Any] = {
++                        key: round(max(0.0, float(value)), 3)
++                        for key, value in request_metadata.frontend_timing.items()
++                    }
++                    metrics = res.metrics
++                    if metrics is not None:
++                        queue_ms = max(
++                            0.0,
++                            (metrics.scheduled_ts - metrics.queued_ts) * 1000.0,
++                        )
++                        prefill_ms = max(
++                            0.0,
++                            (metrics.first_token_ts - metrics.scheduled_ts) * 1000.0,
++                        )
++                        vllm_ttft_ms = max(
++                            0.0, float(metrics.first_token_latency) * 1000.0
++                        )
++                        renderer_ms = timing.get("preprocess_total_ms", 0.0)
++                        timing.update(
++                            engine_queue_ms=round(queue_ms, 3),
++                            engine_prefill_ms=round(prefill_ms, 3),
++                            vllm_ttft_ms=round(vllm_ttft_ms, 3),
++                            engine_frontend_to_core_ms=round(
++                                max(
++                                    0.0,
++                                    vllm_ttft_ms
++                                    - renderer_ms
++                                    - queue_ms
++                                    - prefill_ms,
++                                ),
++                                3,
++                            ),
++                        )
++                    timing.update(
++                        request_id=request_id,
++                        prompt_tokens=len(res.prompt_token_ids or []),
++                        cached_tokens=int(res.num_cached_tokens or 0),
++                    )
++                    logger.info("vLLM request stage timing: %s", timing)
++                    # Standards-compliant SSE comments are ignored by ordinary
++                    # OpenAI clients. Cortex consumes this one bounded comment
++                    # to attach exact stage attribution to TTFT breach alerts.
++                    yield f": vllm-timing {json.dumps(timing, separators=(',', ':'))}\n\n"
+                     # Send first response for each request.n (index) with
+                     # the role
+                     role = self.get_chat_request_role(request)
+diff --git a/vllm/entrypoints/openai/engine/protocol.py b/vllm/entrypoints/openai/engine/protocol.py
+--- a/vllm/entrypoints/openai/engine/protocol.py
++++ b/vllm/entrypoints/openai/engine/protocol.py
+@@ -113,6 +113,10 @@ class UsageInfo(OpenAIBaseModel):
+ class RequestResponseMetadata(BaseModel):
+     request_id: str
+     final_usage_info: UsageInfo | None = None
++    # Per-request API/frontend stage timings. Kept off the public response
++    # schema; chat routing exports the bounded values through the first SSE
++    # timing comment for end-to-end attribution.
++    frontend_timing: dict[str, float] = Field(default_factory=dict)
+ 
+ 
+ class JsonSchemaResponseFormat(OpenAIBaseModel):
+diff --git a/vllm/entrypoints/serve/render/serving.py b/vllm/entrypoints/serve/render/serving.py
+--- a/vllm/entrypoints/serve/render/serving.py
++++ b/vllm/entrypoints/serve/render/serving.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import time
+ from collections.abc import Sequence
+ from http import HTTPStatus
+ from typing import Any, cast
+ 
+ from openai_harmony import Message as OpenAIMessage
+@@ -185,6 +186,7 @@ class OpenAIServingRender:
+         request: ChatCompletionRequest,
+         *,
+         skip_mm_cache: bool = False,
++        stage_timings: dict[str, float] | None = None,
+     ) -> tuple[list[ConversationMessage], list[EngineInput]] | ErrorResponse:
+         """Core preprocessing logic for chat requests (no model/engine check).
+ 
+@@ -255,6 +257,7 @@ class OpenAIServingRender:
+                 tool_parser=tool_parser,
+                 skip_mm_cache=skip_mm_cache,
+                 reasoning_parser=self.reasoning_parser,
++                stage_timings=stage_timings,
+             )
+         else:
+             # For GPT-OSS.
+@@ -532,6 +535,7 @@ class OpenAIServingRender:
+         reasoning_parser: type[ReasoningParser] | None = None,
+         *,
+         skip_mm_cache: bool = False,
++        stage_timings: dict[str, float] | None = None,
+     ) -> tuple[list[ConversationMessage], list[EngineInput]]:
+         """Copied from OpenAIServing._preprocess_chat."""
+         renderer = self.renderer
+@@ -557,6 +561,7 @@ class OpenAIServingRender:
+             default_mm_processor_kwargs=getattr(request, "mm_processor_kwargs", None),
+         )
+ 
++        preprocess_started = time.perf_counter()
+         (conversation,), (engine_input,) = await renderer.render_chat_async(
+             [messages],
+             chat_params,
+@@ -567,8 +572,10 @@ class OpenAIServingRender:
+                 if (v := getattr(request, k, None)) is not None
+             },
+             skip_mm_cache=skip_mm_cache,
++            stage_timings=stage_timings,
+         )
+ 
++        adjustment_started = time.perf_counter()
+         if reasoning_parser is not None:
+             tokenizer = renderer.get_tokenizer()
+             request = reasoning_parser(
+@@ -604,4 +611,12 @@ class OpenAIServingRender:
+                     request=request
+                 )
+ 
++        if stage_timings is not None:
++            stage_timings["request_adjustment_ms"] = (
++                time.perf_counter() - adjustment_started
++            ) * 1000.0
++            stage_timings["preprocess_total_ms"] = (
++                time.perf_counter() - preprocess_started
++            ) * 1000.0
++
+         return conversation, [engine_input]
+diff --git a/vllm/renderers/base.py b/vllm/renderers/base.py
+--- a/vllm/renderers/base.py
++++ b/vllm/renderers/base.py
+@@ -1023,6 +1023,7 @@ class BaseRenderer(ABC, Generic[_T]):
+         *,
+         prompt_extras: dict[str, Any] | None = None,
+         skip_mm_cache: bool = False,
++        stage_timings: dict[str, float] | None = None,
+     ):
+         arrival_time = time.time()
+ 
+@@ -1034,16 +1035,27 @@ class BaseRenderer(ABC, Generic[_T]):
+             for conversation in conversations
+         ]
+ 
++        render_started = time.perf_counter()
+         out_conversations = list[list["ConversationMessage"]]()
+         dict_prompts = list[DictPrompt]()
+         for conv, prompt in await asyncio.gather(*rendered):
+             out_conversations.append(conv)
+             dict_prompts.append(prompt)
++        if stage_timings is not None:
++            stage_timings["chat_template_ms"] = (
++                time.perf_counter() - render_started
++            ) * 1000.0
+ 
++        tokenize_started = time.perf_counter()
+         tok_prompts = await self.tokenize_prompts_async(dict_prompts, tok_params)
++        if stage_timings is not None:
++            stage_timings["tokenization_ms"] = (
++                time.perf_counter() - tokenize_started
++            ) * 1000.0
+ 
+         self._apply_prompt_extras(tok_prompts, prompt_extras)
+ 
++        engine_input_started = time.perf_counter()
+         eng_prompts = await asyncio.gather(
+             *(
+                 self.process_for_engine_async(
+@@ -1052,5 +1064,9 @@ class BaseRenderer(ABC, Generic[_T]):
+                 for p in tok_prompts
+             )
+         )
++        if stage_timings is not None:
++            stage_timings["engine_input_ms"] = (
++                time.perf_counter() - engine_input_started
++            ) * 1000.0
+ 
+         return out_conversations, eng_prompts

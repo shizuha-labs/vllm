@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import time
 from collections.abc import Sequence
 from http import HTTPStatus
 from typing import Any, cast
@@ -185,6 +186,7 @@ class OpenAIServingRender:
         request: ChatCompletionRequest,
         *,
         skip_mm_cache: bool = False,
+        stage_timings: dict[str, float] | None = None,
     ) -> tuple[list[ConversationMessage], list[EngineInput]] | ErrorResponse:
         """Core preprocessing logic for chat requests (no model/engine check).
 
@@ -255,6 +257,7 @@ class OpenAIServingRender:
                 tool_parser=tool_parser,
                 skip_mm_cache=skip_mm_cache,
                 reasoning_parser=self.reasoning_parser,
+                stage_timings=stage_timings,
             )
         else:
             # For GPT-OSS.
@@ -532,6 +535,7 @@ class OpenAIServingRender:
         reasoning_parser: type[ReasoningParser] | None = None,
         *,
         skip_mm_cache: bool = False,
+        stage_timings: dict[str, float] | None = None,
     ) -> tuple[list[ConversationMessage], list[EngineInput]]:
         """Copied from OpenAIServing._preprocess_chat."""
         renderer = self.renderer
@@ -557,6 +561,7 @@ class OpenAIServingRender:
             default_mm_processor_kwargs=getattr(request, "mm_processor_kwargs", None),
         )
 
+        preprocess_started = time.perf_counter()
         (conversation,), (engine_input,) = await renderer.render_chat_async(
             [messages],
             chat_params,
@@ -567,8 +572,10 @@ class OpenAIServingRender:
                 if (v := getattr(request, k, None)) is not None
             },
             skip_mm_cache=skip_mm_cache,
+            stage_timings=stage_timings,
         )
 
+        adjustment_started = time.perf_counter()
         if reasoning_parser is not None:
             tokenizer = renderer.get_tokenizer()
             request = reasoning_parser(
@@ -603,5 +610,13 @@ class OpenAIServingRender:
                 request = tool_parser(tokenizer, request.tools).adjust_request(
                     request=request
                 )
+
+        if stage_timings is not None:
+            stage_timings["request_adjustment_ms"] = (
+                time.perf_counter() - adjustment_started
+            ) * 1000.0
+            stage_timings["preprocess_total_ms"] = (
+                time.perf_counter() - preprocess_started
+            ) * 1000.0
 
         return conversation, [engine_input]

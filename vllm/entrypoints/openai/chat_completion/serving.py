@@ -196,6 +196,7 @@ class OpenAIServingChat(OpenAIServing):
     async def render_chat_request(
         self,
         request: ChatCompletionRequest,
+        stage_timings: dict[str, float] | None = None,
     ) -> tuple[list[ConversationMessage], list[EngineInput]] | ErrorResponse:
         """
         Validate the model and preprocess a chat completion request.
@@ -207,7 +208,12 @@ class OpenAIServingChat(OpenAIServing):
             A tuple of (conversation, engine_inputs) on success,
             or an ErrorResponse on failure.
         """
+        model_check_started = time.perf_counter()
         error_check_ret = await self._check_model(request)
+        if stage_timings is not None:
+            stage_timings["model_check_ms"] = (
+                time.perf_counter() - model_check_started
+            ) * 1000.0
         if error_check_ret is not None:
             logger.error("Error with model %s", error_check_ret)
             return error_check_ret
@@ -218,7 +224,9 @@ class OpenAIServingChat(OpenAIServing):
         if self.engine_client.errored:
             raise self.engine_client.dead_error
 
-        return await self.openai_serving_render.render_chat(request)
+        return await self.openai_serving_render.render_chat(
+            request, stage_timings=stage_timings
+        )
 
     async def create_chat_completion(
         self,
@@ -241,9 +249,20 @@ class OpenAIServingChat(OpenAIServing):
         request: ChatCompletionRequest,
         raw_request: Request | None = None,
     ) -> AsyncGenerator[str, None] | ChatCompletionResponse | ErrorResponse:
+        frontend_started = time.perf_counter()
+        request_id = (
+            f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
+        )
+        request_metadata = RequestResponseMetadata(request_id=request_id)
+        if raw_request:
+            # Publish the propagated ID before rendering so errors and slow
+            # frontend stages remain attributable to the inbound request.
+            raw_request.state.request_metadata = request_metadata
+
         # Streaming response
         tokenizer = self.renderer.tokenizer
         assert tokenizer is not None
+        setup_started = time.perf_counter()
         chat_template_kwargs = self._effective_chat_template_kwargs(request)
         reasoning_parser: ReasoningParser | None = None
         if self.reasoning_parser_cls:
@@ -251,19 +270,19 @@ class OpenAIServingChat(OpenAIServing):
                 tokenizer,
                 chat_template_kwargs=chat_template_kwargs,  # type: ignore[call-arg]
             )
-        result = await self.render_chat_request(request)
+        request_metadata.frontend_timing["request_setup_ms"] = (
+            time.perf_counter() - setup_started
+        ) * 1000.0
+        result = await self.render_chat_request(
+            request, stage_timings=request_metadata.frontend_timing
+        )
+        request_metadata.frontend_timing["frontend_total_ms"] = (
+            time.perf_counter() - frontend_started
+        ) * 1000.0
         if isinstance(result, ErrorResponse):
             return result
 
         conversation, engine_inputs = result
-
-        request_id = (
-            f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
-        )
-
-        request_metadata = RequestResponseMetadata(request_id=request_id)
-        if raw_request:
-            raw_request.state.request_metadata = request_metadata
 
         lora_request = self._maybe_get_adapters(request, supports_default_mm_loras=True)
 
@@ -510,6 +529,49 @@ class OpenAIServingChat(OpenAIServing):
                 # response (by the try...catch).
                 if first_iteration:
                     num_cached_tokens = res.num_cached_tokens
+                    timing: dict[str, Any] = {
+                        key: round(max(0.0, float(value)), 3)
+                        for key, value in request_metadata.frontend_timing.items()
+                    }
+                    metrics = res.metrics
+                    if metrics is not None:
+                        queue_ms = max(
+                            0.0,
+                            (metrics.scheduled_ts - metrics.queued_ts) * 1000.0,
+                        )
+                        prefill_ms = max(
+                            0.0,
+                            (metrics.first_token_ts - metrics.scheduled_ts) * 1000.0,
+                        )
+                        vllm_ttft_ms = max(
+                            0.0, float(metrics.first_token_latency) * 1000.0
+                        )
+                        renderer_ms = timing.get("preprocess_total_ms", 0.0)
+                        timing.update(
+                            engine_queue_ms=round(queue_ms, 3),
+                            engine_prefill_ms=round(prefill_ms, 3),
+                            vllm_ttft_ms=round(vllm_ttft_ms, 3),
+                            engine_frontend_to_core_ms=round(
+                                max(
+                                    0.0,
+                                    vllm_ttft_ms
+                                    - renderer_ms
+                                    - queue_ms
+                                    - prefill_ms,
+                                ),
+                                3,
+                            ),
+                        )
+                    timing.update(
+                        request_id=request_id,
+                        prompt_tokens=len(res.prompt_token_ids or []),
+                        cached_tokens=int(res.num_cached_tokens or 0),
+                    )
+                    logger.info("vLLM request stage timing: %s", timing)
+                    # Standards-compliant SSE comments are ignored by ordinary
+                    # OpenAI clients. Cortex consumes this one bounded comment
+                    # to attach exact stage attribution to TTFT breach alerts.
+                    yield f": vllm-timing {json.dumps(timing, separators=(',', ':'))}\n\n"
                     # Send first response for each request.n (index) with
                     # the role
                     role = self.get_chat_request_role(request)
