@@ -156,7 +156,7 @@ jobs:
           CONTENT=$(git ls-files "$DIR" | sort | xargs sha256sum | sha256sum | cut -c1-12)
           JOB="ci-verify-vllm-retention-${CONTENT}"
           EXPECTED_DIGEST=$(curl --fail --silent --show-error --head \
-            -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+            -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
             "http://registry.registry.svc.cluster.local:5000/v2/vllm-ds4-sm121/manifests/rfc37003-${CONTENT}" \
             | awk 'tolower($1) == "docker-content-digest:" {gsub("\\r", "", $2); print $2}')
           test -n "$EXPECTED_DIGEST"
