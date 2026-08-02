@@ -63,8 +63,6 @@ jobs:
           echo "verified source content rfc37003-${CONTENT}"
 
       - name: Install pinned kubectl and cluster access
-        env:
-          PACKAGE_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           KUBECTL_ARCH=$(uname -m)
@@ -73,12 +71,8 @@ jobs:
             aarch64) KUBECTL_ARCH=arm64; KUBECTL_SHA=2695afc60eea47880ba71c9a01412693b2246c1c76623a352a727db566a6d8b5 ;;
             *) echo "unsupported runner architecture: $KUBECTL_ARCH" >&2; exit 1 ;;
           esac
-          AUTH_CONFIG=$(mktemp)
-          trap 'rm -f "$AUTH_CONFIG"' EXIT
-          chmod 600 "$AUTH_CONFIG"
-          printf 'user = "x-token-auth:%s"\n' "$PACKAGE_TOKEN" > "$AUTH_CONFIG"
-          URL="http://forgejo-http.origin.svc.cluster.local/api/packages/shizuha-labs/generic/kubectl-k3s1/v1.34.6/kubectl-linux-${KUBECTL_ARCH}"
-          curl --config "$AUTH_CONFIG" --fail --location --silent --show-error \
+          URL="https://dl.k8s.io/release/v1.34.6/bin/linux/${KUBECTL_ARCH}/kubectl"
+          curl --fail --location --silent --show-error \
             --retry 3 --retry-all-errors --connect-timeout 10 --max-time 120 \
             -o kubectl "$URL"
           echo "$KUBECTL_SHA  kubectl" | sha256sum --check
