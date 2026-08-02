@@ -76,7 +76,7 @@ jobs:
           AUTH_CONFIG=$(mktemp)
           trap 'rm -f "$AUTH_CONFIG"' EXIT
           chmod 600 "$AUTH_CONFIG"
-          printf 'header = "Authorization: token %s"\n' "$PACKAGE_TOKEN" > "$AUTH_CONFIG"
+          printf 'user = "x-token-auth:%s"\n' "$PACKAGE_TOKEN" > "$AUTH_CONFIG"
           URL="http://forgejo-http.origin.svc.cluster.local/api/packages/shizuha-labs/generic/kubectl-k3s1/v1.34.6/kubectl-linux-${KUBECTL_ARCH}"
           curl --config "$AUTH_CONFIG" --fail --location --silent --show-error \
             --retry 3 --retry-all-errors --connect-timeout 10 --max-time 120 \
