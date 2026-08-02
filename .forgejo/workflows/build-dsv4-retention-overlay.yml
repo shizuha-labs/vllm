@@ -67,8 +67,8 @@ jobs:
           set -euo pipefail
           KUBECTL_ARCH=$(uname -m)
           case "$KUBECTL_ARCH" in
-            x86_64) KUBECTL_ARCH=amd64; KUBECTL_SHA=7c81556ac1212213a07180f92eca57db8caef886e58bbad15e9dada10782c10d ;;
-            aarch64) KUBECTL_ARCH=arm64; KUBECTL_SHA=2695afc60eea47880ba71c9a01412693b2246c1c76623a352a727db566a6d8b5 ;;
+            x86_64) KUBECTL_ARCH=amd64; KUBECTL_SHA=3166155b17198c0af34ff5a360bd4d9d58db98bafadc6f3c2a57ae560563cd6b ;;
+            aarch64) KUBECTL_ARCH=arm64; KUBECTL_SHA=a49a439f83f504e6bc051f516a8baf8d2220d74110f7f9bcaf25feac69e368d1 ;;
             *) echo "unsupported runner architecture: $KUBECTL_ARCH" >&2; exit 1 ;;
           esac
           URL="https://dl.k8s.io/release/v1.34.6/bin/linux/${KUBECTL_ARCH}/kubectl"
