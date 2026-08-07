@@ -253,6 +253,18 @@ class BlockPool:
                 that can never serve a hit stay out of the prefix-cache hash
                 map.
         """
+        # RFC-37003 companion (operator 2026-08-07): a kv_ephemeral request
+        # (compaction summary, benchmark) is one-shot — its prefix is never
+        # requested again. Skip hash registration entirely: its new blocks keep
+        # block_hash=None, so the #43447 free path classifies them as scratch
+        # and PREPENDS them (recycled first), instead of parking ~250K dead
+        # tokens at the BACK of the eviction queue where they displace live
+        # sessions' reusable prefixes (agent-shion/agent-ren evictions).
+        # Blocks it merely READ (shared leading prefix) are already hashed and
+        # keep their normal cached lifecycle.
+        _extra = getattr(getattr(request, "sampling_params", None), "extra_args", None) or {}
+        if _extra.get("kv_ephemeral"):
+            return
         if num_cached_blocks >= num_full_blocks:
             self._apply_retention_hook(request, blocks, num_full_blocks, block_size)
             return

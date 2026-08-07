@@ -29,6 +29,14 @@ class ChatCompletionRequest(_BaseChatCompletionRequest):
         max_length=128,
         description="Opaque owner scope for retention refresh/downgrade.",
     )
+    kv_ephemeral: bool | None = Field(
+        default=None,
+        description=(
+            "One-shot request whose KV is never reused (compaction summaries, "
+            "benchmarks): skip prefix-cache registration so its blocks are "
+            "recycled first instead of displacing reusable cache."
+        ),
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -116,11 +124,17 @@ class ChatCompletionRequest(_BaseChatCompletionRequest):
 
     def to_sampling_params(self, *args, **kwargs):
         params = super().to_sampling_params(*args, **kwargs)
-        if self.retention_directives is not None or self.retention_scope is not None:
+        if (
+            self.retention_directives is not None
+            or self.retention_scope is not None
+            or self.kv_ephemeral
+        ):
             extra_args = dict(params.extra_args or {})
             if self.retention_directives is not None:
                 extra_args["retention_directives"] = self.retention_directives
             if self.retention_scope is not None:
                 extra_args["retention_scope"] = self.retention_scope
+            if self.kv_ephemeral:
+                extra_args["kv_ephemeral"] = True
             params.extra_args = extra_args
         return params

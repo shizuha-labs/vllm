@@ -245,3 +245,48 @@ def test_protocol_fields_validation_and_sampling_round_trip(tmp_path):
                 {"start": 16, "end": 32, "priority": 90},
             ],
         )
+
+
+def test_block_pool_skips_cache_registration_for_kv_ephemeral():
+    """kv_ephemeral requests (operator 2026-08-07): one-shot prompts never
+    register prefix-cache hashes, so their blocks stay scratch and the #43447
+    free path prepends them (recycled first) instead of displacing live
+    sessions' reusable cache."""
+    source = (HERE / "vllm/v1/core/block_pool.py").read_text()
+    guard = source.index('_extra.get("kv_ephemeral")')
+    hashing = source.index("cached_block_hash_to_block.insert")
+    assert guard < hashing, "ephemeral guard must run before hash registration"
+    # The guard returns before BOTH the hash insertion and the retention hook.
+    guard_block = source[guard: source.index("new_full_blocks = blocks", guard)]
+    assert "return" in guard_block
+
+
+def test_protocol_kv_ephemeral_round_trip(tmp_path):
+    try:
+        import vllm._C  # noqa: F401
+    except ModuleNotFoundError:
+        pytest.skip("full protocol validation runs in the vendor-image CI gate")
+    protocol_dir = tmp_path / "chat_completion_eph"
+    protocol_dir.mkdir()
+    shutil.copyfile(
+        Path("vllm/entrypoints/openai/chat_completion/protocol.py"),
+        protocol_dir / "protocol_base.py",
+    )
+    shutil.copyfile(
+        HERE / "vllm/entrypoints/openai/chat_completion/protocol_retention.py",
+        protocol_dir / "protocol.py",
+    )
+    module = _load_module("retention_protocol_eph_test", protocol_dir / "protocol.py")
+    request = module.ChatCompletionRequest(
+        model="dummy",
+        messages=[{"role": "user", "content": "hi"}],
+        kv_ephemeral=True,
+    )
+    params = request.to_sampling_params(16, {})
+    assert params.extra_args["kv_ephemeral"] is True
+    plain = module.ChatCompletionRequest(
+        model="dummy",
+        messages=[{"role": "user", "content": "hi"}],
+    )
+    plain_params = plain.to_sampling_params(16, {})
+    assert not (plain_params.extra_args or {}).get("kv_ephemeral")
