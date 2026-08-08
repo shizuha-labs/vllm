@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from math import lcm
@@ -252,11 +253,47 @@ class KVCacheCoordinator(ABC):
         for manager in self.single_type_managers:
             manager.remove_skipped_blocks(request_id, total_computed_tokens)
 
+    def _protected_free_watermark_blocks(self) -> int:
+        """Minimum free-queue depth maintained when protection is released.
+
+        2026-08-08 incident: ``_has_enough_free_blocks`` released protection
+        only up to the immediate allocation's need, so the free queue hovered
+        permanently near ZERO (93-97% "usage" at idle — the entire pool ref-
+        pinned by protected prompt blocks). Every released block was recycled
+        almost immediately, so parked sessions died in strict protection-FIFO
+        order the moment the FIFO front reached them: a just-touched 179K
+        prefix was destroyed within 2min21s on an 11.3M-token pool
+        (agent-nami, tp8), and co-homed megas annihilated each other in a
+        self-sustaining rebuild cascade (7 evictions of 130-320K in 37 min).
+
+        Releasing to a WATERMARK instead keeps an LRU tail of the pool as a
+        deep free queue: released prompt blocks stay findable as cached
+        prefixes (the #43447 ordering keeps scratch ahead of them) for hours
+        of churn instead of milliseconds, and a session that comes back warm
+        is simply re-protected. Protection semantics for DSV4 hybrid-align
+        reuse are unchanged — only the starvation is gone.
+        """
+        cached = getattr(self, "_protected_free_watermark", None)
+        if cached is None:
+            frac_raw = os.environ.get("VLLM_PROTECTED_FREE_WATERMARK_FRAC", "0.30")
+            try:
+                frac = float(frac_raw)
+            except ValueError:
+                frac = 0.30
+            frac = min(max(frac, 0.0), 0.95)
+            cached = int(self.block_pool.num_gpu_blocks * frac)
+            self._protected_free_watermark = cached
+        return cached
+
     def release_protected_prompt_blocks(
         self,
         target_free_blocks: int | None = None,
         block_ids_to_skip: set[int] | None = None,
     ) -> None:
+        if target_free_blocks is not None:
+            target_free_blocks = max(
+                target_free_blocks, self._protected_free_watermark_blocks()
+            )
         for manager in self.single_type_managers:
             if (
                 target_free_blocks is not None

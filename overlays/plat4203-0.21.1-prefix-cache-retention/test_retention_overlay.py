@@ -290,3 +290,37 @@ def test_protocol_kv_ephemeral_round_trip(tmp_path):
     )
     plain_params = plain.to_sampling_params(16, {})
     assert not (plain_params.extra_args or {}).get("kv_ephemeral")
+
+
+def test_coordinator_release_maintains_free_queue_watermark(monkeypatch):
+    """2026-08-08: releasing protection only to the immediate allocation's
+    need kept the free queue permanently near-empty — parked prompts were
+    recycled within minutes of protection release (agent-nami 179K in 2m21s
+    on an 11.3M pool). The coordinator must raise the release target to a
+    pool-fraction watermark so released prompt blocks retire through a DEEP
+    LRU free queue instead of being recycled immediately."""
+    source = (HERE / "vllm/v1/core/kv_cache_coordinator.py").read_text()
+    assert "_protected_free_watermark_blocks" in source
+    assert "VLLM_PROTECTED_FREE_WATERMARK_FRAC" in source
+    assert "target_free_blocks = max(" in source
+
+    # Exercise the watermark math on a stub (method is self-contained).
+    import types
+
+    ns: dict = {"os": __import__("os")}
+    method_src = source[source.index("    def _protected_free_watermark_blocks") :]
+    method_src = method_src[: method_src.index("\n    def release_protected_prompt_blocks")]
+    exec("import os\n" + "def _wm(self):" + method_src.split(") -> int:", 1)[1], ns)
+
+    class _Pool:
+        num_gpu_blocks = 10_000
+
+    stub = types.SimpleNamespace(block_pool=_Pool())
+    monkeypatch.delenv("VLLM_PROTECTED_FREE_WATERMARK_FRAC", raising=False)
+    assert ns["_wm"](stub) == 3_000  # default 0.30
+    stub2 = types.SimpleNamespace(block_pool=_Pool())
+    monkeypatch.setenv("VLLM_PROTECTED_FREE_WATERMARK_FRAC", "0")
+    assert ns["_wm"](stub2) == 0  # hatch: restore old behaviour
+    stub3 = types.SimpleNamespace(block_pool=_Pool())
+    monkeypatch.setenv("VLLM_PROTECTED_FREE_WATERMARK_FRAC", "2.0")
+    assert ns["_wm"](stub3) == 9_500  # clamped to 0.95
