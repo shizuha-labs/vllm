@@ -86,7 +86,20 @@ class SingleTypeKVCacheManager(ABC):
         self.kv_cache_group_id = kv_cache_group_id
         self._null_block = block_pool.null_block
         self._protected_prompt_block_ids: set[int] = set()
-        self._protected_prompt_block_queue: deque[int] = deque()
+        # Release-order queue of (seq, block_id). Two ordering rules, both
+        # learned from agent-rui 2026-08-08 (272K warm home read 0% cached
+        # 6min after a 99.8% hit):
+        #   1. LRU across prompts — a re-protected (re-touched) block moves to
+        #      the queue BACK via a new seq (lazy dedup: stale positions are
+        #      skipped on pop), so a burst release consumes least-recently-
+        #      used prefixes first instead of protection-birth order.
+        #   2. Tail-first within a prompt — blocks enqueue in reversed order,
+        #      matching free()'s own convention, so a partial release keeps
+        #      the head chain intact and the prefix still yields partial
+        #      cache hits (find_longest_cache_hit walks from block 0).
+        self._protected_prompt_block_queue: deque[tuple[int, int]] = deque()
+        self._protected_prompt_block_seq: dict[int, int] = {}
+        self._protected_prompt_seq_counter = 0
 
     @classmethod
     def _get_num_evictable_blocks(cls, blocks: Sequence[KVCacheBlock]):
@@ -292,15 +305,28 @@ class SingleTypeKVCacheManager(ABC):
 
         protected: list[KVCacheBlock] = []
         for block in blocks:
-            if (
-                block.is_null
-                or block.block_hash is None
-                or block.block_id in self._protected_prompt_block_ids
-            ):
+            if block.is_null or block.block_hash is None:
+                continue
+            if block.block_id in self._protected_prompt_block_ids:
+                # Re-touch: freshen this block's release position (rule 1).
+                # The stale queue entry is skipped lazily on pop.
                 continue
             protected.append(block)
             self._protected_prompt_block_ids.add(block.block_id)
-            self._protected_prompt_block_queue.append(block.block_id)
+
+        # Enqueue tail-first (rule 2) with fresh seqs, and freshen the seqs of
+        # every re-touched block of this prompt so the whole prompt moves to
+        # the release-queue back together, tail still ahead of head.
+        for block in reversed(blocks):
+            if block.is_null or block.block_hash is None:
+                continue
+            if block.block_id not in self._protected_prompt_block_ids:
+                continue
+            self._protected_prompt_seq_counter += 1
+            seq = self._protected_prompt_seq_counter
+            self._protected_prompt_block_seq[block.block_id] = seq
+            self._protected_prompt_block_queue.append((seq, block.block_id))
+        self._compact_protected_prompt_queue()
 
         if not protected:
             return
@@ -325,20 +351,45 @@ class SingleTypeKVCacheManager(ABC):
     ) -> bool:
         attempts = len(self._protected_prompt_block_queue)
         while attempts:
-            block_id = self._protected_prompt_block_queue.popleft()
+            seq, block_id = self._protected_prompt_block_queue.popleft()
             attempts -= 1
             if block_id not in self._protected_prompt_block_ids:
+                self._protected_prompt_block_seq.pop(block_id, None)
+                continue
+            # Lazy LRU dedup: a re-touched block re-enqueued with a newer seq
+            # leaves this stale entry behind — releasing on it would destroy a
+            # recently-warm prefix in protection-birth order (agent-rui).
+            if self._protected_prompt_block_seq.get(block_id) != seq:
                 continue
             if block_ids_to_skip is not None and block_id in block_ids_to_skip:
-                self._protected_prompt_block_queue.append(block_id)
+                self._protected_prompt_block_queue.append((seq, block_id))
                 continue
 
             self._protected_prompt_block_ids.remove(block_id)
+            self._protected_prompt_block_seq.pop(block_id, None)
             block = self.block_pool.blocks[block_id]
             if block.ref_cnt > 0:
                 self.block_pool.free_blocks([block])
             return True
         return False
+
+    def _compact_protected_prompt_queue(self) -> None:
+        """Drop stale (superseded-seq) entries once they dominate the queue.
+
+        Re-touch freshening appends a new entry per protected block per prompt
+        registration; without compaction a chatty mega-session grows the queue
+        unboundedly. Rebuild in-order when stale entries outnumber live 2:1.
+        """
+        if len(self._protected_prompt_block_queue) <= 2 * max(
+            1, len(self._protected_prompt_block_ids)
+        ):
+            return
+        self._protected_prompt_block_queue = deque(
+            (seq, block_id)
+            for seq, block_id in self._protected_prompt_block_queue
+            if block_id in self._protected_prompt_block_ids
+            and self._protected_prompt_block_seq.get(block_id) == seq
+        )
 
     def release_protected_prompt_blocks(
         self,

@@ -324,3 +324,120 @@ def test_coordinator_release_maintains_free_queue_watermark(monkeypatch):
     stub3 = types.SimpleNamespace(block_pool=_Pool())
     monkeypatch.setenv("VLLM_PROTECTED_FREE_WATERMARK_FRAC", "2.0")
     assert ns["_wm"](stub3) == 9_500  # clamped to 0.95
+
+
+def _protection_stub_cls():
+    """Bind the real protection/release methods onto a minimal stub manager."""
+    import textwrap
+    from collections import deque
+
+    source = (HERE / "vllm/v1/core/single_type_kv_cache_manager.py").read_text()
+
+    def extract(name: str) -> str:
+        start = source.index(f"    def {name}")
+        nxt = source.index("\n    def ", start + 10)
+        return textwrap.dedent(source[start:nxt])
+
+    ns: dict = {"deque": deque, "Sequence": list, "KVCacheBlock": object}
+    for name in (
+        "_protect_prompt_blocks",
+        "_release_one_protected_prompt_block",
+        "_compact_protected_prompt_queue",
+        "release_protected_prompt_blocks",
+    ):
+        exec(extract(name), ns)  # noqa: S102 — sources under test
+
+    class _Blk:
+        def __init__(self, bid):
+            self.block_id = bid
+            self.block_hash = ("h", bid)
+            self.is_null = False
+            self.ref_cnt = 1
+
+    class _Pool:
+        def __init__(self):
+            self.blocks = {}
+            self.freed = []
+
+        def touch(self, blocks):
+            pass
+
+        def free_blocks(self, blocks):
+            self.freed.extend(b.block_id for b in blocks)
+
+        def get_num_free_blocks(self):
+            return len(self.freed)
+
+    class _Mgr:
+        enable_caching = True
+        _protect_prompt_blocks = ns["_protect_prompt_blocks"]
+        _release_one_protected_prompt_block = ns["_release_one_protected_prompt_block"]
+        _compact_protected_prompt_queue = ns["_compact_protected_prompt_queue"]
+        release_protected_prompt_blocks = ns["release_protected_prompt_blocks"]
+
+        def __init__(self):
+            self.block_pool = _Pool()
+            self._protected_prompt_block_ids = set()
+            self._protected_prompt_block_queue = deque()
+            self._protected_prompt_block_seq = {}
+            self._protected_prompt_seq_counter = 0
+
+        def _trim_protected_prompt_blocks(self):
+            pass
+
+        def protect(self, bids):
+            blocks = []
+            for bid in bids:
+                blk = self.block_pool.blocks.get(bid) or _Blk(bid)
+                self.block_pool.blocks[bid] = blk
+                blocks.append(blk)
+            self._protect_prompt_blocks(blocks)
+
+    return _Mgr
+
+
+def test_protection_release_frees_prompt_tail_before_head():
+    """agent-rui 2026-08-08: releasing a prompt's HEAD blocks first breaks the
+    find_longest_cache_hit chain at block 0 — a 272K prefix read 0% cached
+    while most of its blocks were still resident. Release must consume each
+    prompt tail-first (the same convention free() documents), so a partially
+    released prefix still yields partial hits."""
+    mgr = _protection_stub_cls()()
+    mgr.protect([1, 2, 3, 4, 5, 6])
+    for _ in range(3):
+        assert mgr._release_one_protected_prompt_block()
+    assert mgr.block_pool.freed == [6, 5, 4]
+    assert {1, 2, 3} <= mgr._protected_prompt_block_ids
+
+
+def test_protection_release_is_lru_across_prompts_on_retouch():
+    """A re-touched (still warm) prompt must move to the release-queue back;
+    a burst release consumes least-recently-used prompts first, not
+    protection-birth order (rui was re-touched 3min before the wave and
+    still died first under FIFO)."""
+    mgr = _protection_stub_cls()()
+    mgr.protect([1, 2, 3])      # prompt A (older)
+    mgr.protect([11, 12, 13])   # prompt B
+    mgr.protect([1, 2, 3])      # A re-touched — now the warmest
+    for _ in range(3):
+        assert mgr._release_one_protected_prompt_block()
+    assert mgr.block_pool.freed == [13, 12, 11]  # B (LRU) went first, tail-first
+    assert {1, 2, 3} <= mgr._protected_prompt_block_ids
+    for _ in range(3):
+        assert mgr._release_one_protected_prompt_block()
+    assert mgr.block_pool.freed[3:] == [3, 2, 1]  # then A, tail-first
+
+
+def test_protection_queue_compacts_stale_retouch_entries():
+    """Lazy LRU dedup leaves superseded entries behind; the queue must stay
+    bounded (≤2× live) across chatty re-registrations of the same prompt."""
+    mgr = _protection_stub_cls()()
+    for _ in range(50):
+        mgr.protect([1, 2, 3, 4])
+    assert len(mgr._protected_prompt_block_queue) <= 2 * len(
+        mgr._protected_prompt_block_ids
+    )
+    for _ in range(4):
+        assert mgr._release_one_protected_prompt_block()
+    assert mgr.block_pool.freed == [4, 3, 2, 1]
+    assert not mgr._release_one_protected_prompt_block()
