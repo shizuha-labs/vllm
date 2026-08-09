@@ -8,15 +8,22 @@ ARG VLLM_BASE_IMAGE=aidendle94/sparkrun-vllm-ds4-gb10@sha256:f869281d869b2a1d418
 FROM ${VLLM_BASE_IMAGE}
 COPY apply_unified_overlay.py /tmp/apply_unified_overlay.py
 COPY diffs/frontend_timing.patch /tmp/frontend_timing.patch
+COPY diffs/tool_parser_progress.patch /tmp/tool_parser_progress.patch
 RUN /opt/env/bin/python /tmp/apply_unified_overlay.py \
       --root /opt/env/lib/python3.12/site-packages \
       --patch /tmp/frontend_timing.patch \
+    && /opt/env/bin/python /tmp/apply_unified_overlay.py \
+      --root /opt/env/lib/python3.12/site-packages \
+      --patch /tmp/tool_parser_progress.patch \
     && /opt/env/bin/python -m py_compile \
       /opt/env/lib/python3.12/site-packages/vllm/entrypoints/openai/chat_completion/serving.py \
       /opt/env/lib/python3.12/site-packages/vllm/entrypoints/openai/engine/protocol.py \
       /opt/env/lib/python3.12/site-packages/vllm/entrypoints/serve/render/serving.py \
       /opt/env/lib/python3.12/site-packages/vllm/renderers/base.py \
-    && rm -f /tmp/apply_unified_overlay.py /tmp/frontend_timing.patch
+    && rm -f \
+      /tmp/apply_unified_overlay.py \
+      /tmp/frontend_timing.patch \
+      /tmp/tool_parser_progress.patch
 COPY vllm/envs.py /opt/env/lib/python3.12/site-packages/vllm/envs.py
 COPY vllm/v1/core/block_pool.py /opt/env/lib/python3.12/site-packages/vllm/v1/core/block_pool.py
 COPY vllm/v1/core/priority_eviction_queue.py /opt/env/lib/python3.12/site-packages/vllm/v1/core/priority_eviction_queue.py

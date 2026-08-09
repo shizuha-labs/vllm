@@ -441,3 +441,45 @@ def test_protection_queue_compacts_stale_retouch_entries():
         assert mgr._release_one_protected_prompt_block()
     assert mgr.block_pool.freed == [4, 3, 2, 1]
     assert not mgr._release_one_protected_prompt_block()
+
+
+def test_tool_parser_progress_overlay_is_bounded_and_metadata_only():
+    """A parser-suppressed delta can stay externally silent for minutes.
+
+    The overlay emits a standards-compliant SSE comment at bounded cadence,
+    but leaves the parser and its atomic tool-JSON emission untouched.
+    """
+    patch = (HERE / "diffs/tool_parser_progress.patch").read_text()
+    assert patch.count("diff --git ") == 1
+    assert (
+        "diff --git a/vllm/entrypoints/openai/chat_completion/serving.py "
+        "b/vllm/entrypoints/openai/chat_completion/serving.py"
+    ) in patch
+    assert "deepseekv4_tool_parser.py" not in patch
+    assert "deepseekv32_tool_parser.py" not in patch
+
+    assert '_TOOL_PARSER_PROGRESS_INTERVAL_SECONDS: Final = 5.0' in patch
+    assert '"stage": "tool_parser"' in patch
+    assert '"request_id": request_id' in patch
+    assert '"sequence": sequence' in patch
+    assert 'return f": vllm-progress ' in patch
+    assert "data:" not in patch
+
+    progress_branch = patch.index("# A tool parser can intentionally buffer")
+    continue_after_progress = patch.index("continue", progress_branch)
+    for proof in (
+        "output.token_ids",
+        "tool_parser is not None",
+        "request.tools",
+        'request.tool_choice != "none"',
+        "time.monotonic()",
+        "_TOOL_PARSER_PROGRESS_INTERVAL_SECONDS",
+        "yield _tool_parser_progress_comment",
+    ):
+        assert patch.index(proof, progress_branch) < continue_after_progress
+
+    dockerfile = (HERE / "Dockerfile").read_text()
+    timing_apply = dockerfile.index("--patch /tmp/frontend_timing.patch")
+    progress_apply = dockerfile.index("--patch /tmp/tool_parser_progress.patch")
+    compile_gate = dockerfile.index("python -m py_compile")
+    assert timing_apply < progress_apply < compile_gate

@@ -1,0 +1,68 @@
+diff --git a/vllm/entrypoints/openai/chat_completion/serving.py b/vllm/entrypoints/openai/chat_completion/serving.py
+--- a/vllm/entrypoints/openai/chat_completion/serving.py
++++ b/vllm/entrypoints/openai/chat_completion/serving.py
+@@ -81,6 +81,22 @@
+-
++
+ logger = init_logger(__name__)
+-
++
++_TOOL_PARSER_PROGRESS_INTERVAL_SECONDS: Final = 5.0
++
++
++def _tool_parser_progress_comment(request_id: str, sequence: int) -> str:
++    """Build a non-content SSE heartbeat for buffered tool-call decoding.
++
++    Keep this deliberately metadata-only: tool parsers must retain sole
++    ownership of when complete, valid tool JSON becomes client-visible.
++    """
++    progress = {
++        "request_id": request_id,
++        "stage": "tool_parser",
++        "sequence": sequence,
++    }
++    return f": vllm-progress {json.dumps(progress, separators=(',', ':'))}\n\n"
++
+-
++
+ class OpenAIServingChat(OpenAIServing):
+     def __init__(
+@@ -431,6 +447,8 @@
+         created_time = int(time.time())
+         chunk_object_type: Final = "chat.completion.chunk"
+         first_iteration = True
++        tool_parser_progress_sequence = 0
++        last_tool_parser_progress_at = time.monotonic()
+-
++
+         # Send response for each token for each request.n (index)
+         num_choices = 1 if request.n is None else request.n
+@@ -824,6 +842,27 @@
+                             output.finish_reason is None
+                             and not request.return_token_ids
+                         ):
++                            # A tool parser can intentionally buffer many
++                            # advancing decode tokens until a complete invoke is
++                            # available. Prove liveness at bounded cadence without
++                            # exposing partial or invalid tool JSON.
++                            if (
++                                output.token_ids
++                                and tool_parser is not None
++                                and request.tools
++                                and request.tool_choice != "none"
++                            ):
++                                now = time.monotonic()
++                                if (
++                                    now - last_tool_parser_progress_at
++                                    >= _TOOL_PARSER_PROGRESS_INTERVAL_SECONDS
++                                ):
++                                    tool_parser_progress_sequence += 1
++                                    last_tool_parser_progress_at = now
++                                    yield _tool_parser_progress_comment(
++                                        request_id,
++                                        tool_parser_progress_sequence,
++                                    )
+                             continue
+                         delta_message = DeltaMessage()
+-
++

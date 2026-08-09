@@ -1,5 +1,7 @@
 """Vendor-image gate for RFC-37003 retention and DeepSeek overlay wiring."""
 
+import inspect
+import json
 import os
 from types import SimpleNamespace
 
@@ -8,6 +10,10 @@ os.environ["VLLM_DSV4_SINGLE_EAGLE_DROP"] = "1"
 
 from vllm import envs
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+from vllm.entrypoints.openai.chat_completion.serving import (
+    OpenAIServingChat,
+    _tool_parser_progress_comment,
+)
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.core.sched.scheduler import _install_prefix_cache_recompute_floor
@@ -137,4 +143,46 @@ assert floor_manager.prefix_cache_stats.calls == [{
     "num_hits": 57_856,
     "preempted": False,
 }]
+
+# Buffered tool parsing must prove continued decode progress without exposing
+# any partial tool-call bytes as an OpenAI data event.
+progress_frame = _tool_parser_progress_comment("chatcmpl-progress-test", 7)
+assert progress_frame.startswith(": vllm-progress ")
+assert progress_frame.endswith("\n\n")
+assert "data:" not in progress_frame
+progress_payload = json.loads(progress_frame.removeprefix(": vllm-progress "))
+assert progress_payload == {
+    "request_id": "chatcmpl-progress-test",
+    "stage": "tool_parser",
+    "sequence": 7,
+}
+
+stream_source = inspect.getsource(
+    OpenAIServingChat.chat_completion_stream_generator
+)
+progress_branch = stream_source.index("# A tool parser can intentionally buffer")
+continue_after_progress = stream_source.index("continue", progress_branch)
+assert (
+    stream_source.index("output.token_ids", progress_branch)
+    < continue_after_progress
+)
+assert (
+    stream_source.index("tool_parser is not None", progress_branch)
+    < continue_after_progress
+)
+assert stream_source.index("request.tools", progress_branch) < continue_after_progress
+assert (
+    stream_source.index('request.tool_choice != "none"', progress_branch)
+    < continue_after_progress
+)
+assert (
+    stream_source.index("time.monotonic()", progress_branch)
+    < continue_after_progress
+)
+assert stream_source.index(
+    "_TOOL_PARSER_PROGRESS_INTERVAL_SECONDS", progress_branch
+) < continue_after_progress
+assert stream_source.index(
+    "yield _tool_parser_progress_comment", progress_branch
+) < continue_after_progress
 print("RETENTION VENDOR GATE PASS")
