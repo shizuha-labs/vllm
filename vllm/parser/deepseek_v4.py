@@ -44,6 +44,10 @@ DSML_THINK_START = "<think>"
 DSML_THINK_END = "</think>"
 DSML_TOOL_START = f"<{_DSML}tool_calls>"
 DSML_TOOL_END = f"</{_DSML}tool_calls>"
+# vLLM #51914 (0731 + DSpark): model intermittently drops the underscore
+# (`tool_calls` → `toolcalls`). Treat that typo as TOOL_START so the lexer
+# does not dump the wrapper into content.
+DSML_TOOL_START_TYPO = f"<{_DSML}toolcalls>"
 DSML_INVOKE_PREFIX = f'<{_DSML}invoke name="'
 DSML_INVOKE_NAME_END = '">'
 DSML_INVOKE_END = f"</{_DSML}invoke>"
@@ -130,6 +134,7 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
             "THINK_START": DSML_THINK_START,
             "THINK_END": DSML_THINK_END,
             "TOOL_START": DSML_TOOL_START,
+            "TOOL_START_TYPO": DSML_TOOL_START_TYPO,
             "TOOL_END": DSML_TOOL_END,
             "INVOKE_PREFIX": DSML_INVOKE_PREFIX,
             "INVOKE_NAME_END": DSML_INVOKE_NAME_END,
@@ -166,9 +171,31 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
                 ParserState.TOOL_PREAMBLE,
                 (EventType.REASONING_END,),
             ),
+            (ParserState.REASONING, "TOOL_START_TYPO"): Transition(
+                ParserState.TOOL_PREAMBLE,
+                (EventType.REASONING_END,),
+            ),
             (ParserState.CONTENT, "TOOL_START"): Transition(
                 ParserState.TOOL_PREAMBLE,
                 (),
+            ),
+            (ParserState.CONTENT, "TOOL_START_TYPO"): Transition(
+                ParserState.TOOL_PREAMBLE,
+                (),
+            ),
+            # Orphan-invoke recovery (vllm#48931 / PR#49117 class):
+            # At long context the model often omits <tool_calls> but still
+            # emits a well-formed <invoke ...> block. Without this edge the
+            # whole call leaks into content as raw DSML. Additive: wrapped path
+            # unchanged.
+            (ParserState.CONTENT, "INVOKE_PREFIX"): Transition(
+                ParserState.TOOL_NAME,
+                (EventType.TOOL_CALL_START,),
+            ),
+            # Same recovery when the model starts a tool call before  response.
+            (ParserState.REASONING, "INVOKE_PREFIX"): Transition(
+                ParserState.TOOL_NAME,
+                (EventType.REASONING_END, EventType.TOOL_CALL_START),
             ),
             (ParserState.TOOL_PREAMBLE, "INVOKE_PREFIX"): Transition(
                 ParserState.TOOL_NAME,
