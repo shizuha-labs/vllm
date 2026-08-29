@@ -1190,6 +1190,7 @@ typer==0.26.8
 typing-extensions==4.15.0
     # via
     #   -r requirements/test/../common.txt
+    #   aiohttp
     #   aiosignal
     #   albumentations
     #   alembic
